@@ -47,21 +47,7 @@ TEST_SIZE    = 0.30
 RANDOM_STATE = 42
 
 # ── Per-cohort Isolation Forest parameters ───────────────────────────
-#
-# max_samples : fraction of n_train used per tree.
-#   "auto" = min(256, n_train), which gives Epithelial only 14 %
-#   coverage per tree — the primary cause of the low specificity.
-#   Explicit fractions give all cohorts adequate per-tree coverage.
-#
-# max_features : fraction of features considered per split.
-#   1.0 (default) → trees reuse the same dominant correlated miRNAs.
-#   Reducing forces diverse isolation paths → better outlier scores.
-#   Most aggressive for Epithelial (largest, most correlated cohort).
-#
-# contamination : "auto" sets the decision boundary at 0, matching
-#   the OC-SVM convention — no change to threshold logic needed.
-#
-# n_jobs=-1 : all CPU cores; random_state is added per-fold below.
+
 
 COHORT_IF_PARAMS = {
     "Epithelial": dict(
