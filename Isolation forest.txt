@@ -780,29 +780,6 @@ for fname, desc in files_out:
 
 print(textwrap.dedent(f"""
   ─────────────────────────────────────────────────────────────────
-  Parameter rationale summary
-  ─────────────────────────────────────────────────────────────────
-  Sample sizes (approximate 70 % train):
-    Epithelial     ~1827 train  →  max_samples=0.5  (~914/tree)
-    Haematological  ~526 train  →  max_samples=0.8  (~421/tree)
-    Neurological    ~371 train  →  max_samples=1.0  (~371/tree)
-
-  Previous "auto" resolved to min(256, n_train):
-    Epithelial only used 256/1827 = 14 % of data per tree —
-    the primary cause of the low specificity in the previous run.
-
-  max_features reduced from 1.0 to per-cohort values:
-    Epithelial 0.3  |  Haematological 0.5  |  Neurological 0.7
-    Forces trees to find diverse isolation paths through the
-    highly correlated 1881-dimensional miRNA feature space.
-    Effect is strongest for Epithelial where feature correlations
-    are most damaging to isolation quality.
-
-  TreeSHAP (unchanged):
-    Exact path-dependent Shapley values.  No background sampling.
-    Sign: positive = outlier driver (negated raw mean SHAP).
-
-  Threshold strategy (unchanged):
-    Maximise Specificity s.t. Sensitivity >= {MIN_SENSITIVITY}.
+Analysis complete
   ─────────────────────────────────────────────────────────────────
 """))
