@@ -1,0 +1,875 @@
+"""
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Isolation Forest  ·  Sarcoma miRNA Anomaly Detection Pipeline
+  Cohorts: Epithelial | Haematological | Neurological vs. Sarcoma
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Key design decisions vs. previous version
+───────────────────────────────────────────
+  Per-cohort IsolationForest parameters (COHORT_IF_PARAMS):
+    Different cohort sizes demand different settings.
+
+    max_samples
+    ───────────
+    Previous "auto" = min(256, n_train).
+    Problem: for Epithelial (~1827 train samples), each tree saw
+    only 256/1827 ≈ 14 % of the data — trees were starved and
+    produced an undiscriminating score surface.
+    Fix: set max_samples as a fraction of training size so every
+    cohort's trees see a comparable proportion of the data.
+
+      Epithelial     n_train ≈ 1827  →  max_samples = 0.5  (~914/tree)
+      Haematological n_train ≈  526  →  max_samples = 0.8  (~421/tree)
+      Neurological   n_train ≈  371  →  max_samples = 1.0  (all, ~371/tree)
+
+    max_features
+    ────────────
+    Default = 1.0 (all 1881 miRNAs per split).
+    Problem: highly correlated miRNA expression data causes trees to
+    split repeatedly on the same dominant features, making the score
+    surface smooth and undiscriminating — worst for large cohorts
+    with a well-settled covariance structure (Epithelial).
+    Fix: reduce max_features so trees must find diverse isolation
+    paths, improving outlier sensitivity.
+
+      Epithelial     0.3  (most aggressive subsampling; largest cohort,
+                          most correlated feature space)
+      Haematological 0.5  (moderate)
+      Neurological   0.7  (already discriminates well; gentler change)
+
+    n_estimators
+    ────────────
+    Increased for Epithelial (300) to compensate for the harder
+    discrimination task.  Others stay at 200.
+
+Feature importance  — SHAP TreeExplainer (exact, path-dependent)
+──────────────────────────────────────────────────────────────────
+  Sarcoma never enters training or the scaler fit.
+  TreeSHAP reads tree structure only — no background sampling.
+  Sign: positive = outlier driver (negated raw mean SHAP).
+
+Threshold strategy  — CONSTRAINED OPTIMISATION (unchanged)
+────────────────────────────────────────────────────────────
+  Maximise Specificity  s.t.  Sensitivity >= MIN_SENSITIVITY.
+  Fallback to Youden point on edge cases.
+
+Data leakage guarantees (unchanged)
+─────────────────────────────────────
+  Variance filter and StandardScaler fitted on train split only.
+  Sarcoma is held out throughout: no fitting, no scaling source.
+"""
+
+# ─────────────────────────────────────────────────────────────────────
+# 0.  IMPORTS
+# ─────────────────────────────────────────────────────────────────────
+import os, warnings, textwrap, time
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+import seaborn as sns
+import shap
+from sklearn.ensemble import IsolationForest
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import ShuffleSplit
+from sklearn.metrics import (
+    roc_auc_score, average_precision_score,
+    roc_curve, precision_recall_curve, f1_score,
+)
+
+warnings.filterwarnings("ignore")
+np.random.seed(42)
+
+# ─────────────────────────────────────────────────────────────────────
+# 1.  CONFIGURATION  ←  edit only this block
+# ─────────────────────────────────────────────────────────────────────
+DATA_DIR   = r"C:\Users\MJ\Desktop\Revised Bioinfo paper data\All data"
+OUTPUT_DIR = r"C:\Users\MJ\Desktop\Revised Bioinfo paper data\Results"
+
+FILES = {
+    "Epithelial":     "Epithelial_Selected_Combined.csv",
+    "Haematological": "Haematological_Selected_Combined.csv",
+    "Neurological":   "Neurological_Selected_Combined.csv",
+    "Sarcoma":        "Sarcoma_Selected_Combined.csv",
+}
+
+N_SPLITS     = 5
+TEST_SIZE    = 0.30
+RANDOM_STATE = 42
+
+# ── Per-cohort Isolation Forest parameters ───────────────────────────
+#
+# max_samples : fraction of n_train used per tree.
+#   "auto" = min(256, n_train), which gives Epithelial only 14 %
+#   coverage per tree — the primary cause of the low specificity.
+#   Explicit fractions give all cohorts adequate per-tree coverage.
+#
+# max_features : fraction of features considered per split.
+#   1.0 (default) → trees reuse the same dominant correlated miRNAs.
+#   Reducing forces diverse isolation paths → better outlier scores.
+#   Most aggressive for Epithelial (largest, most correlated cohort).
+#
+# contamination : "auto" sets the decision boundary at 0, matching
+#   the OC-SVM convention — no change to threshold logic needed.
+#
+# n_jobs=-1 : all CPU cores; random_state is added per-fold below.
+
+COHORT_IF_PARAMS = {
+    "Epithelial": dict(
+        n_estimators  = 700,    
+        max_samples   = 0.5,    
+        max_features  = 0.3,    
+        contamination = "auto",
+        n_jobs        = -1,
+    ),
+    "Haematological": dict(
+        n_estimators  = 400,
+        max_samples   = 0.6,    
+        max_features  = 0.5,    
+        contamination = "auto",
+        n_jobs        = -1,
+    ),
+    "Neurological": dict(
+        n_estimators  = 200,
+        max_samples   = 0.7,    
+        max_features  = 0.7,    
+        contamination = "auto",
+        n_jobs        = -1,
+    ),
+}
+
+# Variance pre-filter (applied to train split only; -1 = keep all)
+VAR_THRESHOLD = -1
+
+# ── Threshold strategy ──────────────────────────────────────────────
+MIN_SENSITIVITY = 0.80
+
+# Plotting / overlap
+TOP_N = 20
+
+COHORT_COLORS = {
+    "Epithelial":     "#4C72B0",
+    "Haematological": "#DD8452",
+    "Neurological":   "#55A868",
+}
+
+# ─────────────────────────────────────────────────────────────────────
+# 2.  HELPERS
+# ─────────────────────────────────────────────────────────────────────
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+def savefig(name, dpi=150):
+    path = os.path.join(OUTPUT_DIR, name)
+    plt.savefig(path, dpi=dpi, bbox_inches="tight")
+    plt.close()
+    print(f"      saved  ->  {path}")
+
+def load_cohort(name):
+    path = os.path.join(DATA_DIR, FILES[name])
+    df   = pd.read_csv(path, index_col=0)
+    print(f"  {name:>15s}:  {df.shape[0]} patients  x  {df.shape[1]} miRNAs")
+    return df
+
+def align_features(*dfs):
+    common = sorted(
+        set(dfs[0].columns).intersection(*[set(d.columns) for d in dfs[1:]])
+    )
+    print(f"\n  Shared miRNA features across all cohorts: {len(common)}")
+    return tuple(df[common] for df in dfs), common
+
+def constrained_threshold(fpr, tpr, thresholds, min_sensitivity=0.80):
+    """
+    Find the threshold that maximises Specificity subject to
+    Sensitivity >= min_sensitivity.
+    Falls back to Youden point if no threshold achieves min_sensitivity.
+    """
+    tpr_arr = np.array(tpr)
+    fpr_arr = np.array(fpr)
+    thr_arr = np.array(thresholds)
+
+    valid = tpr_arr >= min_sensitivity
+    if valid.any():
+        best = np.argmin(fpr_arr[valid])
+        idx  = np.where(valid)[0][best]
+        return thr_arr[idx], tpr_arr[idx], 1.0 - fpr_arr[idx], False
+    else:
+        j   = tpr_arr - fpr_arr
+        idx = np.argmax(j)
+        return thr_arr[idx], tpr_arr[idx], 1.0 - fpr_arr[idx], True
+
+
+# ─────────────────────────────────────────────────────────────────────
+# HELPER — SHAP TreeExplainer (exact, path-dependent)
+# ─────────────────────────────────────────────────────────────────────
+def shap_importance_fold(model, X_sar_s, keep_idx, n_features_full):
+    """
+    Compute exact SHAP feature importance for one fold via TreeExplainer.
+
+    Parameters
+    ----------
+    model           : fitted IsolationForest
+    X_sar_s         : scaled sarcoma samples  (n_sar, n_fold_features)
+    keep_idx        : indices surviving the variance filter this fold
+    n_features_full : total features in the global feature list
+
+    Returns
+    -------
+    full_importance : ndarray (n_features_full,)
+        Negated mean SHAP, mapped back to full feature space.
+        Positive = outlier driver.  Zero = filtered out this fold.
+
+    Notes
+    ─────
+    • feature_perturbation="tree_path_dependent" uses the conditional
+      distribution implied by tree paths — correct for correlated
+      miRNA features.  No background data needed.
+    • TreeSHAP reads tree structure only; it never refits the model
+      and sarcoma never enters training.
+    • Sign: IsolationForest.decision_function gives lower scores to
+      outliers.  Negative raw SHAP = feature pulls score down =
+      outlier driver.  We negate so positive = outlier driver,
+      matching the original permutation importance convention.
+    """
+    explainer = shap.TreeExplainer(
+        model,
+        feature_perturbation="tree_path_dependent",
+    )
+    shap_vals       = np.array(explainer.shap_values(X_sar_s))
+    fold_importance = -shap_vals.mean(axis=0)
+
+    full_importance           = np.zeros(n_features_full)
+    full_importance[keep_idx] = fold_importance
+    return full_importance
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 3.  LOAD & ALIGN
+# ─────────────────────────────────────────────────────────────────────
+print("\n" + "="*65)
+print("  LOADING DATA")
+print("="*65)
+
+raw = {name: load_cohort(name) for name in FILES}
+
+(epi_df, hae_df, neu_df, sar_df), feature_names = align_features(
+    raw["Epithelial"], raw["Haematological"],
+    raw["Neurological"], raw["Sarcoma"],
+)
+feature_names = np.array(feature_names)
+X_sarcoma = sar_df.values.astype(float)
+
+NORMAL_COHORTS = {
+    "Epithelial":     epi_df,
+    "Haematological": hae_df,
+    "Neurological":   neu_df,
+}
+
+print(f"\n  Sarcoma cohort  : {X_sarcoma.shape[0]} patients  "
+      f"(held-out — never used in training)")
+print(f"  Min sensitivity : {MIN_SENSITIVITY}")
+print(f"\n  Per-cohort IF parameters:")
+for c, p in COHORT_IF_PARAMS.items():
+    n_approx = int(raw[c].shape[0] * (1 - TEST_SIZE))
+    ms = p["max_samples"]
+    samples_per_tree = int(n_approx * ms) if isinstance(ms, float) else n_approx
+    print(f"    {c:<15s}  n_estimators={p['n_estimators']}  "
+          f"max_samples={p['max_samples']} (~{samples_per_tree}/tree)  "
+          f"max_features={p['max_features']}")
+
+# ─────────────────────────────────────────────────────────────────────
+# 4.  CROSS-VALIDATION
+# ─────────────────────────────────────────────────────────────────────
+print("\n" + "="*65)
+print("  CROSS-VALIDATION  (5-fold ShuffleSplit 70/30)")
+print("="*65)
+
+ss = ShuffleSplit(n_splits=N_SPLITS, test_size=TEST_SIZE,
+                  random_state=RANDOM_STATE)
+
+all_metrics    = []
+all_fpr        = {c: [] for c in NORMAL_COHORTS}
+all_tpr        = {c: [] for c in NORMAL_COHORTS}
+all_prec       = {c: [] for c in NORMAL_COHORTS}
+all_rec        = {c: [] for c in NORMAL_COHORTS}
+all_auc_roc    = {c: [] for c in NORMAL_COHORTS}
+all_auc_pr     = {c: [] for c in NORMAL_COHORTS}
+all_opt_thr    = {c: [] for c in NORMAL_COHORTS}
+all_sens_thr   = {c: [] for c in NORMAL_COHORTS}
+all_spec_thr   = {c: [] for c in NORMAL_COHORTS}
+shap_accum     = {c: np.zeros(len(feature_names)) for c in NORMAL_COHORTS}
+
+for cohort_name, X_normal_df in NORMAL_COHORTS.items():
+    X_norm    = X_normal_df.values.astype(float)
+    if_params = COHORT_IF_PARAMS[cohort_name]   # ← cohort-specific params
+
+    print(f"\n  ── {cohort_name}  (n={X_norm.shape[0]}) ──")
+
+    for fold_idx, (train_idx, val_idx) in enumerate(ss.split(X_norm)):
+        t0 = time.time()
+
+        # ── Split ─────────────────────────────────────────────────
+        X_train_raw = X_norm[train_idx]
+        X_val_raw   = X_norm[val_idx]
+
+        # ── Variance filter on TRAIN only ─────────────────────────
+        feat_var  = np.var(X_train_raw, axis=0)
+        keep_mask = feat_var > VAR_THRESHOLD
+        keep_idx  = np.where(keep_mask)[0]
+
+        X_train_f = X_train_raw[:, keep_mask]
+        X_val_f   = X_val_raw[:,   keep_mask]
+        X_sar_f   = X_sarcoma[:,   keep_mask]
+
+        # ── Scale on TRAIN only ───────────────────────────────────
+        # Sarcoma is only transformed, never used to fit the scaler.
+        scaler    = StandardScaler()
+        X_train_s = scaler.fit_transform(X_train_f)
+        X_val_s   = scaler.transform(X_val_f)
+        X_sar_s   = scaler.transform(X_sar_f)
+
+        # ── Train IsolationForest ─────────────────────────────────
+        # Per-cohort params; fold offset on random_state for
+        # reproducible but non-identical trees across folds.
+        # Sarcoma data is NEVER passed to fit().
+        model = IsolationForest(
+            **if_params,
+            random_state=RANDOM_STATE + fold_idx,
+        )
+        model.fit(X_train_s)
+
+        # ── Decision scores ───────────────────────────────────────
+        scores_val = model.decision_function(X_val_s)
+        scores_sar = model.decision_function(X_sar_s)
+
+        y_true  = np.concatenate([np.ones(len(scores_val)),
+                                   np.zeros(len(scores_sar))])
+        y_score = np.concatenate([scores_val, scores_sar])
+
+        # ── Threshold-free metrics ────────────────────────────────
+        auc_roc = roc_auc_score(y_true, y_score)
+        auc_pr  = average_precision_score(y_true, y_score)
+
+        # ── ROC / PR curves ───────────────────────────────────────
+        fpr, tpr, roc_thr = roc_curve(y_true, y_score)
+        prec, rec, _      = precision_recall_curve(y_true, y_score)
+
+        all_fpr[cohort_name].append(fpr)
+        all_tpr[cohort_name].append(tpr)
+        all_prec[cohort_name].append(prec)
+        all_rec[cohort_name].append(rec)
+        all_auc_roc[cohort_name].append(auc_roc)
+        all_auc_pr[cohort_name].append(auc_pr)
+
+        # ── Constrained threshold ─────────────────────────────────
+        opt_thr, opt_sens, opt_spec, fallback = constrained_threshold(
+            fpr, tpr, roc_thr, min_sensitivity=MIN_SENSITIVITY
+        )
+        all_opt_thr[cohort_name].append(opt_thr)
+        all_sens_thr[cohort_name].append(opt_sens)
+        all_spec_thr[cohort_name].append(opt_spec)
+
+        y_pred = (y_score >= opt_thr).astype(int)
+        f1     = f1_score(y_true, y_pred)
+
+        tp = np.sum((y_pred == 1) & (y_true == 1))
+        tn = np.sum((y_pred == 0) & (y_true == 0))
+        fp = np.sum((y_pred == 1) & (y_true == 0))
+        fn = np.sum((y_pred == 0) & (y_true == 1))
+        sensitivity = tp / (tp + fn) if (tp + fn) else 0.0
+        specificity = tn / (tn + fp) if (tn + fp) else 0.0
+
+        fallback_note = "  [FALLBACK:Youden]" if fallback else ""
+        elapsed_cv    = time.time() - t0
+
+        print(f"    Fold {fold_idx+1}  "
+              f"AUC-ROC={auc_roc:.3f}  AUC-PR={auc_pr:.3f}  "
+              f"F1={f1:.3f}  Sens={sensitivity:.3f}  Spec={specificity:.3f}  "
+              f"Thr={opt_thr:.4f}{fallback_note}  ({elapsed_cv:.1f}s)  "
+              f"[TreeSHAP...]",
+              end="", flush=True)
+
+        all_metrics.append({
+            "cohort": cohort_name, "fold": fold_idx + 1,
+            "AUC_ROC": auc_roc, "AUC_PR": auc_pr,
+            "F1": f1, "Sensitivity": sensitivity, "Specificity": specificity,
+            "Threshold": opt_thr, "Fallback_Youden": fallback,
+            "n_train": len(train_idx), "n_val": len(val_idx),
+            "n_features_used": int(keep_mask.sum()),
+        })
+
+        # ── TreeSHAP importance ────────────────────────────────────
+        t1       = time.time()
+        full_imp = shap_importance_fold(
+            model           = model,
+            X_sar_s         = X_sar_s,
+            keep_idx        = keep_idx,
+            n_features_full = len(feature_names),
+        )
+        shap_accum[cohort_name] += full_imp
+        print(f"  TreeSHAP done ({time.time()-t1:.1f}s)")
+
+    # Average across folds
+    shap_accum[cohort_name] /= N_SPLITS
+
+    # ── Save per-cohort importance CSV ────────────────────────────────
+    label  = cohort_name.lower()[:4]
+    imp_df = pd.DataFrame({
+        "miRNA":           feature_names,
+        "shap_importance": shap_accum[cohort_name],
+    }).sort_values("shap_importance", ascending=False).reset_index(drop=True)
+    imp_df.index     += 1
+    imp_df.index.name = "rank"
+
+    fname = f"importance_{label}_vs_sarcoma.csv"
+    imp_df.to_csv(os.path.join(OUTPUT_DIR, fname))
+    print(f"  COMPLETE: {cohort_name}  ->  saved {fname}")
+
+# ─────────────────────────────────────────────────────────────────────
+# 5.  METRICS TABLE
+# ─────────────────────────────────────────────────────────────────────
+metrics_df = pd.DataFrame(all_metrics)
+metrics_df.to_csv(os.path.join(OUTPUT_DIR, "cv_metrics.csv"), index=False)
+
+print("\n\n" + "="*65)
+print(f"  METRICS SUMMARY  (mean ± std, 5 folds | min_sens={MIN_SENSITIVITY})")
+print("="*65)
+summary = (metrics_df
+           .groupby("cohort")[["AUC_ROC","AUC_PR","F1",
+                                "Sensitivity","Specificity","Threshold"]]
+           .agg(["mean","std"])
+           .round(4))
+print(summary.to_string())
+
+fallbacks = metrics_df[metrics_df.Fallback_Youden]
+if len(fallbacks):
+    print(f"\n  WARNING: {len(fallbacks)} fold(s) fell back to Youden "
+          f"(could not achieve Sensitivity >= {MIN_SENSITIVITY}):")
+    print(fallbacks[["cohort","fold","Sensitivity","Specificity"]].to_string())
+
+# ─────────────────────────────────────────────────────────────────────
+# 6.  PLOT – ROC curves
+# ─────────────────────────────────────────────────────────────────────
+print("\n\n  Generating plots...")
+
+fig, axes = plt.subplots(1, 3, figsize=(18, 5), sharey=True)
+fig.suptitle(
+    f"ROC Curves – Isolation Forest  (Normal vs Sarcoma)\n"
+    f"Operating point: max Specificity s.t. Sensitivity ≥ {MIN_SENSITIVITY}",
+    fontsize=13, fontweight="bold")
+
+for ax, (cohort_name, color) in zip(axes, COHORT_COLORS.items()):
+    mean_fpr    = np.linspace(0, 1, 300)
+    interp_tprs = []
+
+    for fpr, tpr in zip(all_fpr[cohort_name], all_tpr[cohort_name]):
+        it = np.interp(mean_fpr, fpr, tpr)
+        interp_tprs.append(it)
+        ax.plot(fpr, tpr, color=color, alpha=0.2, lw=1)
+
+    mean_tpr = np.mean(interp_tprs, axis=0)
+    std_tpr  = np.std(interp_tprs,  axis=0)
+    m_auc    = np.mean(all_auc_roc[cohort_name])
+    s_auc    = np.std(all_auc_roc[cohort_name])
+
+    ax.plot(mean_fpr, mean_tpr, color=color, lw=2.5,
+            label=f"Mean AUC = {m_auc:.3f} ± {s_auc:.3f}")
+    ax.fill_between(mean_fpr, mean_tpr - std_tpr,
+                    mean_tpr + std_tpr, alpha=0.15, color=color)
+    ax.axhline(MIN_SENSITIVITY, color="dimgray", lw=1.2, ls=":",
+               label=f"Min Sens floor ({MIN_SENSITIVITY})")
+
+    mean_sens = np.mean(all_sens_thr[cohort_name])
+    mean_spec = np.mean(all_spec_thr[cohort_name])
+    ax.scatter(1 - mean_spec, mean_sens, s=100, zorder=6,
+               color=color, edgecolors="black", lw=1.5,
+               label=f"Op. pt  Sens={mean_sens:.2f}  Spec={mean_spec:.2f}")
+
+    ax.plot([0, 1], [0, 1], "k--", lw=0.8)
+    ax.set(xlim=[0,1], ylim=[0,1.02],
+           xlabel="False Positive Rate",
+           ylabel="True Positive Rate",
+           title=f"{cohort_name} vs Sarcoma")
+    ax.legend(fontsize=7, loc="lower right")
+    ax.grid(alpha=0.3)
+
+plt.tight_layout()
+savefig("01_ROC_curves.png")
+
+# ─────────────────────────────────────────────────────────────────────
+# 7.  PLOT – PR curves
+# ─────────────────────────────────────────────────────────────────────
+fig, axes = plt.subplots(1, 3, figsize=(18, 5), sharey=True)
+fig.suptitle("Precision-Recall Curves – Isolation Forest",
+             fontsize=14, fontweight="bold")
+
+for ax, (cohort_name, color) in zip(axes, COHORT_COLORS.items()):
+    grid      = np.linspace(0, 1, 300)
+    interp_ps = []
+
+    for prec, rec in zip(all_prec[cohort_name], all_rec[cohort_name]):
+        rs = rec[::-1]; ps = prec[::-1]
+        interp_ps.append(np.interp(grid, rs, ps))
+        ax.plot(rec, prec, color=color, alpha=0.2, lw=1)
+
+    mean_p = np.mean(interp_ps, axis=0)
+    std_p  = np.std(interp_ps,  axis=0)
+    m_ap   = np.mean(all_auc_pr[cohort_name])
+    s_ap   = np.std(all_auc_pr[cohort_name])
+
+    ax.plot(grid, mean_p, color=color, lw=2.5,
+            label=f"Mean AP = {m_ap:.3f} ± {s_ap:.3f}")
+    ax.fill_between(grid, mean_p - std_p, mean_p + std_p,
+                    alpha=0.15, color=color)
+    ax.set(xlim=[0,1], ylim=[0,1.02],
+           xlabel="Recall", ylabel="Precision",
+           title=f"{cohort_name} vs Sarcoma")
+    ax.legend(fontsize=7.5, loc="upper right")
+    ax.grid(alpha=0.3)
+
+plt.tight_layout()
+savefig("02_PR_curves.png")
+
+# ─────────────────────────────────────────────────────────────────────
+# 8.  PLOT – Metrics boxplot
+# ─────────────────────────────────────────────────────────────────────
+fig, axes = plt.subplots(1, 5, figsize=(20, 5))
+fig.suptitle(
+    f"CV Metric Distributions  (5 folds | constrained threshold, "
+    f"min Sens={MIN_SENSITIVITY})",
+    fontsize=12, fontweight="bold")
+palette = [COHORT_COLORS[c] for c in NORMAL_COHORTS]
+
+for ax, metric in zip(axes, ["AUC_ROC","AUC_PR","F1",
+                               "Sensitivity","Specificity"]):
+    data = [metrics_df.loc[metrics_df.cohort==c, metric].values
+            for c in NORMAL_COHORTS]
+    bp   = ax.boxplot(data, patch_artist=True,
+                      medianprops=dict(color="black", lw=2))
+    for patch, col in zip(bp["boxes"], palette):
+        patch.set_facecolor(col); patch.set_alpha(0.75)
+
+    ax.set_xticklabels(list(NORMAL_COHORTS.keys()), rotation=15, fontsize=9)
+    ax.set_title(metric, fontsize=11)
+    ax.set_ylim([-0.05, 1.05])
+    ax.grid(axis="y", alpha=0.3)
+
+    if metric == "Sensitivity":
+        ax.axhline(MIN_SENSITIVITY, color="dimgray", lw=1.2, ls=":",
+                   label=f"Min floor ({MIN_SENSITIVITY})")
+        ax.legend(fontsize=7)
+
+    for xi, vals in enumerate(data, start=1):
+        ax.text(xi, np.mean(vals) + 0.03, f"{np.mean(vals):.3f}",
+                ha="center", fontsize=7.5)
+
+plt.tight_layout()
+savefig("03_metrics_boxplot.png")
+
+# ─────────────────────────────────────────────────────────────────────
+# 9.  PLOT – Sensitivity vs Specificity tradeoff across folds
+# ─────────────────────────────────────────────────────────────────────
+fig, ax = plt.subplots(figsize=(7, 6))
+
+for cohort_name, color in COHORT_COLORS.items():
+    sens_vals = metrics_df.loc[metrics_df.cohort==cohort_name, "Sensitivity"].values
+    spec_vals = metrics_df.loc[metrics_df.cohort==cohort_name, "Specificity"].values
+
+    ax.scatter(sens_vals, spec_vals, color=color, s=90, zorder=5,
+               edgecolors="black", lw=0.8, label=cohort_name)
+    for fold_i, (s, sp) in enumerate(zip(sens_vals, spec_vals)):
+        ax.text(s + 0.003, sp + 0.003, str(fold_i+1), fontsize=7.5, color=color)
+    ax.scatter(sens_vals.mean(), spec_vals.mean(), color=color,
+               s=200, marker="*", zorder=6, edgecolors="black", lw=1,
+               label=f"{cohort_name} mean")
+
+ax.axvline(MIN_SENSITIVITY, color="dimgray", lw=1.2, ls=":",
+           label=f"Min Sens floor ({MIN_SENSITIVITY})")
+ax.set_xlabel("Sensitivity  (normal correctly accepted)", fontsize=11)
+ax.set_ylabel("Specificity  (sarcoma correctly flagged)", fontsize=11)
+ax.set_title("Sensitivity vs Specificity per fold\n"
+             "(star = fold mean)", fontsize=12, fontweight="bold")
+ax.set_xlim([0.5, 1.02]); ax.set_ylim([0.5, 1.02])
+ax.legend(fontsize=8, loc="lower left")
+ax.grid(alpha=0.3)
+plt.tight_layout()
+savefig("04_sens_spec_scatter.png")
+
+# ─────────────────────────────────────────────────────────────────────
+# 10. PLOT – SHAP importance bars (per cohort)
+# ─────────────────────────────────────────────────────────────────────
+top_features_per_cohort = {}
+
+for cohort_name in NORMAL_COHORTS:
+    imp    = shap_accum[cohort_name]
+    top_ix = np.argsort(imp)[::-1][:TOP_N]
+    top_f  = feature_names[top_ix]
+    top_v  = imp[top_ix]
+    top_features_per_cohort[cohort_name] = set(top_f)
+
+    color = COHORT_COLORS[cohort_name]
+    fig, ax = plt.subplots(figsize=(9, 6))
+    bars = ax.barh(top_f[::-1], top_v[::-1], color=color,
+                   alpha=0.82, edgecolor="white")
+
+    for bar, val in zip(bars, top_v[::-1]):
+        ax.text(bar.get_width() + max(top_v)*0.01,
+                bar.get_y() + bar.get_height()/2,
+                f"{val:.4f}", va="center", fontsize=7.5)
+
+    ax.set_xlabel(
+        "SHAP Importance  (fold-averaged negated mean Shapley value;\n"
+        "positive = feature pushes sarcoma anomaly score lower = outlier driver)",
+        fontsize=9)
+    ax.set_title(
+        f"Top {TOP_N} miRNAs – Sarcoma Anomaly Drivers\n"
+        f"{cohort_name} Isolation Forest  [TreeSHAP]",
+        fontsize=11, fontweight="bold")
+    ax.grid(axis="x", alpha=0.3)
+    plt.tight_layout()
+    savefig(f"05_Importance_{cohort_name}.png")
+
+# ─────────────────────────────────────────────────────────────────────
+# 11. OVERLAP ANALYSIS
+# ─────────────────────────────────────────────────────────────────────
+print("\n" + "="*65)
+print("  FEATURE OVERLAP ANALYSIS")
+print("="*65)
+
+cohort_names = list(NORMAL_COHORTS.keys())
+all_top      = set().union(*top_features_per_cohort.values())
+
+presence = pd.DataFrame(
+    {c: [int(f in top_features_per_cohort[c]) for f in sorted(all_top)]
+     for c in cohort_names},
+    index=sorted(all_top)
+)
+presence["n_cohorts"] = presence.sum(axis=1)
+
+overlap_2plus = presence[presence.n_cohorts >= 2].sort_values(
+    "n_cohorts", ascending=False)
+overlap_3 = presence[presence.n_cohorts == 3]
+
+print(f"\n  miRNAs in top-{TOP_N} of >= 2 cohort comparisons : {len(overlap_2plus)}")
+print(f"  miRNAs in top-{TOP_N} of ALL 3 cohort comparisons : {len(overlap_3)}")
+
+if len(overlap_3):
+    print(f"\n  Universal markers (all 3 cohorts):")
+    for mir in overlap_3.index:
+        vals = [
+            f"{c}: {shap_accum[c][np.where(feature_names==mir)[0][0]]:.5f}"
+            for c in cohort_names
+        ]
+        print(f"    {mir:30s}  {' | '.join(vals)}")
+else:
+    print(f"\n  No features common to all 3 cohorts within top-{TOP_N}.")
+    print(f"  Tip: increase TOP_N in config.")
+
+overlap_2plus.to_csv(os.path.join(OUTPUT_DIR, "feature_overlap.csv"))
+
+# ─────────────────────────────────────────────────────────────────────
+# 12. PLOT – Overlap heatmap
+# ─────────────────────────────────────────────────────────────────────
+if len(overlap_2plus) > 0:
+    hm_mirnas = overlap_2plus.index.tolist()
+    hm_data   = pd.DataFrame(
+        {c: [shap_accum[c][np.where(feature_names==m)[0][0]]
+             for m in hm_mirnas]
+         for c in cohort_names},
+        index=hm_mirnas
+    )
+    hm_norm = hm_data.div(hm_data.max(axis=1) + 1e-12, axis=0)
+
+    fig_h = max(6, len(hm_mirnas) * 0.40)
+    fig, ax = plt.subplots(figsize=(7.5, fig_h))
+    sns.heatmap(
+        hm_norm, ax=ax, cmap="YlOrRd",
+        linewidths=0.5, linecolor="white",
+        xticklabels=[f"{c}\nvs Sarcoma" for c in cohort_names],
+        yticklabels=hm_mirnas,
+        cbar_kws={"label": "Row-normalised SHAP importance"},
+        annot=hm_data.round(4), fmt=".4f",
+        annot_kws={"size": 7},
+    )
+    for i, mir in enumerate(hm_mirnas):
+        if mir in overlap_3.index:
+            ax.add_patch(plt.Rectangle(
+                (0, i), len(cohort_names), 1,
+                fill=False, edgecolor="#1a1a8c", lw=2.5
+            ))
+
+    patch = mpatches.Patch(edgecolor="#1a1a8c", fill=False,
+                            linewidth=2, label="Present in all 3 cohorts")
+    ax.legend(handles=[patch], loc="upper right",
+              bbox_to_anchor=(1.65, 1.02), fontsize=8)
+    ax.set_title(
+        f"miRNA Overlap Heatmap  (>=2 cohorts, top-{TOP_N} each)\n"
+        "Blue border = universal across all 3 comparisons\n"
+        "[TreeSHAP — Isolation Forest]",
+        fontsize=11, fontweight="bold")
+    plt.tight_layout()
+    savefig("06_overlap_heatmap.png", dpi=150)
+
+# ─────────────────────────────────────────────────────────────────────
+# 13. PLOT – Score distributions (full-data visualisation pass)
+# ─────────────────────────────────────────────────────────────────────
+print("\n  Building score distribution violin plots...")
+
+fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+fig.suptitle(
+    "Isolation Forest Decision Score Distributions\n"
+    "(full-cohort training pass — visualisation only)",
+    fontsize=13, fontweight="bold")
+
+for ax, (cohort_name, X_normal_df) in zip(axes, NORMAL_COHORTS.items()):
+    X_norm    = X_normal_df.values.astype(float)
+    color     = COHORT_COLORS[cohort_name]
+    if_params = COHORT_IF_PARAMS[cohort_name]
+
+    feat_var  = np.var(X_norm, axis=0)
+    keep_mask = feat_var > VAR_THRESHOLD
+    scaler_   = StandardScaler()
+    X_ns      = scaler_.fit_transform(X_norm[:, keep_mask])
+    X_ss      = scaler_.transform(X_sarcoma[:, keep_mask])
+
+    model_ = IsolationForest(**if_params, random_state=RANDOM_STATE)
+    model_.fit(X_ns)
+
+    scores_n = model_.decision_function(X_ns)
+    scores_s = model_.decision_function(X_ss)
+
+    y_t = np.concatenate([np.ones(len(scores_n)), np.zeros(len(scores_s))])
+    y_s = np.concatenate([scores_n, scores_s])
+    fpr_, tpr_, thr_ = roc_curve(y_t, y_s)
+    opt_thr_full, opt_sens_full, opt_spec_full, _ = constrained_threshold(
+        fpr_, tpr_, thr_, min_sensitivity=MIN_SENSITIVITY
+    )
+
+    df_v = pd.DataFrame({
+        "Score": np.concatenate([scores_n, scores_s]),
+        "Group": ["Normal"]*len(scores_n) + ["Sarcoma"]*len(scores_s)
+    })
+    sns.violinplot(data=df_v, x="Group", y="Score", ax=ax,
+                   palette={"Normal": color, "Sarcoma": "#d62728"},
+                   inner="box", cut=0)
+    ax.axhline(0, color="grey", lw=1.2, ls=":", label="IF boundary (0)")
+    ax.axhline(opt_thr_full, color="black", lw=1.8, ls="--",
+               label=(f"Constrained thr ({opt_thr_full:.3f})\n"
+                      f"Sens={opt_sens_full:.2f}  Spec={opt_spec_full:.2f}"))
+    ax.set_title(f"{cohort_name} model", fontsize=11)
+    ax.set_xlabel("")
+    ax.legend(fontsize=7.5)
+    ax.grid(axis="y", alpha=0.3)
+
+plt.tight_layout()
+savefig("07_score_distributions.png")
+
+# ─────────────────────────────────────────────────────────────────────
+# 14. PLOT – AUC summary bar
+# ─────────────────────────────────────────────────────────────────────
+fig, ax = plt.subplots(figsize=(8, 4))
+x = np.arange(len(cohort_names)); w = 0.35
+
+roc_m = [np.mean(all_auc_roc[c]) for c in cohort_names]
+roc_s = [np.std(all_auc_roc[c])  for c in cohort_names]
+pr_m  = [np.mean(all_auc_pr[c])  for c in cohort_names]
+pr_s  = [np.std(all_auc_pr[c])   for c in cohort_names]
+
+b1 = ax.bar(x - w/2, roc_m, w, yerr=roc_s, capsize=5,
+            color=[COHORT_COLORS[c] for c in cohort_names],
+            alpha=0.85, label="AUC-ROC", edgecolor="white")
+b2 = ax.bar(x + w/2, pr_m,  w, yerr=pr_s,  capsize=5,
+            color=[COHORT_COLORS[c] for c in cohort_names],
+            alpha=0.45, label="AUC-PR",  edgecolor="white", hatch="//")
+
+ax.set_xticks(x); ax.set_xticklabels(cohort_names)
+ax.set_ylim([0, 1.12])
+ax.set_ylabel("AUC  (mean ± std, 5 folds)")
+ax.set_title("Discrimination Performance – Normal Cohorts vs Sarcoma",
+             fontsize=12, fontweight="bold")
+ax.legend(); ax.grid(axis="y", alpha=0.3)
+for bar in list(b1) + list(b2):
+    h = bar.get_height()
+    ax.text(bar.get_x() + bar.get_width()/2, h + 0.01,
+            f"{h:.3f}", ha="center", va="bottom", fontsize=8)
+
+plt.tight_layout()
+savefig("08_AUC_summary.png")
+
+# ─────────────────────────────────────────────────────────────────────
+# 15. PLOT – Threshold stability across folds
+# ─────────────────────────────────────────────────────────────────────
+fig, ax = plt.subplots(figsize=(8, 4))
+for cohort_name, color in COHORT_COLORS.items():
+    thresholds = all_opt_thr[cohort_name]
+    ax.plot(range(1, N_SPLITS+1), thresholds, "o-",
+            color=color, lw=2, ms=7, label=cohort_name)
+    ax.axhline(np.mean(thresholds), color=color, lw=1, ls="--", alpha=0.5)
+
+ax.set_xlabel("Fold"); ax.set_ylabel("Constrained optimal threshold")
+ax.set_title(
+    f"Threshold Stability Across Folds\n"
+    f"(constrained: max Spec s.t. Sens >= {MIN_SENSITIVITY})",
+    fontsize=12, fontweight="bold")
+ax.legend(); ax.grid(alpha=0.3)
+plt.tight_layout()
+savefig("09_threshold_stability.png")
+
+# ─────────────────────────────────────────────────────────────────────
+# 16. DONE
+# ─────────────────────────────────────────────────────────────────────
+print("\n" + "="*65)
+print("  ALL DONE")
+print("="*65)
+print(f"\n  Results -> {OUTPUT_DIR}\n")
+
+files_out = [
+    ("cv_metrics.csv",                        "Per-fold metrics table"),
+    ("feature_overlap.csv",                   "miRNA overlap across cohorts"),
+    ("importance_epit_vs_sarcoma.csv",        "All miRNAs ranked – Epithelial  [TreeSHAP]"),
+    ("importance_haem_vs_sarcoma.csv",        "All miRNAs ranked – Haematological  [TreeSHAP]"),
+    ("importance_neur_vs_sarcoma.csv",        "All miRNAs ranked – Neurological  [TreeSHAP]"),
+    ("01_ROC_curves.png",                     "ROC mean ± std + operating point"),
+    ("02_PR_curves.png",                      "Precision-Recall curves"),
+    ("03_metrics_boxplot.png",                "Metric distributions"),
+    ("04_sens_spec_scatter.png",              "Sens vs Spec per fold"),
+    ("05_Importance_Epithelial.png",          "Top-20 miRNAs – Epithelial  [TreeSHAP]"),
+    ("05_Importance_Haematological.png",      "Top-20 miRNAs – Haematological  [TreeSHAP]"),
+    ("05_Importance_Neurological.png",        "Top-20 miRNAs – Neurological  [TreeSHAP]"),
+    ("06_overlap_heatmap.png",                "miRNA overlap heatmap"),
+    ("07_score_distributions.png",            "Score violins + threshold lines"),
+    ("08_AUC_summary.png",                    "AUC-ROC vs AUC-PR summary"),
+    ("09_threshold_stability.png",            "Threshold stability across folds"),
+]
+for fname, desc in files_out:
+    print(f"    {fname:<45s}  {desc}")
+
+print(textwrap.dedent(f"""
+  ─────────────────────────────────────────────────────────────────
+  Parameter rationale summary
+  ─────────────────────────────────────────────────────────────────
+  Sample sizes (approximate 70 % train):
+    Epithelial     ~1827 train  →  max_samples=0.5  (~914/tree)
+    Haematological  ~526 train  →  max_samples=0.8  (~421/tree)
+    Neurological    ~371 train  →  max_samples=1.0  (~371/tree)
+
+  Previous "auto" resolved to min(256, n_train):
+    Epithelial only used 256/1827 = 14 % of data per tree —
+    the primary cause of the low specificity in the previous run.
+
+  max_features reduced from 1.0 to per-cohort values:
+    Epithelial 0.3  |  Haematological 0.5  |  Neurological 0.7
+    Forces trees to find diverse isolation paths through the
+    highly correlated 1881-dimensional miRNA feature space.
+    Effect is strongest for Epithelial where feature correlations
+    are most damaging to isolation quality.
+
+  TreeSHAP (unchanged):
+    Exact path-dependent Shapley values.  No background sampling.
+    Sign: positive = outlier driver (negated raw mean SHAP).
+
+  Threshold strategy (unchanged):
+    Maximise Specificity s.t. Sensitivity >= {MIN_SENSITIVITY}.
+  ─────────────────────────────────────────────────────────────────
+"""))
