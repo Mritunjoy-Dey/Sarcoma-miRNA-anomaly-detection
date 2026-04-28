@@ -20,11 +20,3 @@
 >### KM survival analysis
 >#### Runs Kaplan-Meier overall survival analysis for each consensus miRNA in TCGA-SARC. Patients are dichotomised by median expression; survival curves are compared using the log-rank test. Produces individual and combined KM plots with 95% confidence bands and a summary CSV.
 > -----------------------------------------------------------------
-### Dependencies
->#### numpy pandas scikit-learn shap scipy matplotlib seaborn lifelines
-> -----------------------------------------------------------------
-### Data
-> 
->#### TCGA miRNA expression: Xenabrowser (log₂(RPM+1))
->#### Normal mesenchymal reference: GEO accession GSE163534
-> -----------------------------------------------------------------
