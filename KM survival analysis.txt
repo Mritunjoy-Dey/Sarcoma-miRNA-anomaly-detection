@@ -1,0 +1,174 @@
+import os
+import pandas as pd
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.ticker import MaxNLocator
+from lifelines import KaplanMeierFitter
+from lifelines.statistics import logrank_test
+
+# ─────────────────────────────────────────────
+# CONFIGURATION
+# ─────────────────────────────────────────────
+EXPRESSION_FILE = r"C:\Users\MJ\Desktop\Revised Bioinfo paper data\Clinical data\Sarc_selected_for_normal_comparison_trasn.csv"
+SURVIVAL_FILE   = r"C:\Users\MJ\Desktop\Revised Bioinfo paper data\Clinical data\Sarc_survival data.csv"
+OUTPUT_DIR      = r"C:\Users\MJ\Desktop\Revised Bioinfo paper data\Clinical data\KM_results"
+
+TIME_UNIT   = "Months"
+TIME_COL    = "OS.time"
+EVENT_COL   = "OS"
+PATIENT_COL = "Patient_ID"
+
+HIGH_COLOR = "#D62728"
+LOW_COLOR  = "#1F77B4"
+CI_ALPHA   = 0.12
+FIG_DPI    = 150
+
+# Desired order for combined plot
+DESIRED_ORDER = [
+    "hsa-mir-214",
+    "hsa-mir-1245a",
+    "hsa-mir-767",
+    "hsa-mir-1305",
+    "hsa-mir-3152",
+    "hsa-mir-196a",
+    "hsa-mir-337",
+    "hsa-mir-493"
+]
+# ─────────────────────────────────────────────
+
+
+def load_data(expr_path, surv_path):
+    expr = pd.read_csv(expr_path, sep=None, engine="python")
+    surv = pd.read_csv(surv_path, sep=None, engine="python")
+
+    expr.columns = expr.columns.str.strip()
+    surv.columns = surv.columns.str.strip()
+    expr[PATIENT_COL] = expr[PATIENT_COL].str.strip()
+    surv[PATIENT_COL] = surv[PATIENT_COL].str.strip()
+
+    merged = pd.merge(expr, surv[[PATIENT_COL, TIME_COL, EVENT_COL]],
+                      on=PATIENT_COL, how="inner")
+
+    # ✅ FIX: Convert days → months
+    merged[TIME_COL] = merged[TIME_COL] / 30.44
+
+    print(f"After merge: {merged.shape[0]} patients\n")
+    return merged
+
+
+def km_plot(mirna, df_high, df_low, p_value, ax=None, save_path=None):
+    kmf_high = KaplanMeierFitter()
+    kmf_low  = KaplanMeierFitter()
+
+    kmf_high.fit(df_high[TIME_COL], event_observed=df_high[EVENT_COL], label="High")
+    kmf_low.fit(df_low[TIME_COL],  event_observed=df_low[EVENT_COL],  label="Low")
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(7, 5))
+
+    kmf_high.plot_survival_function(ax=ax, ci_show=True,
+                                   color=HIGH_COLOR, ci_alpha=CI_ALPHA, linewidth=2)
+    kmf_low.plot_survival_function(ax=ax, ci_show=True,
+                                  color=LOW_COLOR, ci_alpha=CI_ALPHA, linewidth=2)
+
+    p_str = f"p = {p_value:.4f}" if p_value >= 0.0001 else "p < 0.0001"
+    ax.text(0.97, 0.97, p_str, transform=ax.transAxes,
+            ha="right", va="top", fontsize=8)
+
+    ax.set_title(mirna, fontsize=10)
+    ax.set_xlabel(f"OS ({TIME_UNIT})", fontsize=9)
+    ax.set_ylabel("Survival", fontsize=9)
+    ax.set_ylim(0, 1.05)
+    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+    ax.spines[["top", "right"]].set_visible(False)
+    ax.legend(fontsize=8)
+
+    if save_path:
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=FIG_DPI)
+        plt.close()
+
+
+def median_survival(kmf):
+    med = kmf.median_survival_time_
+    return round(med, 2) if not np.isinf(med) else "Not reached"
+
+
+def run_analysis():
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    plots_dir = os.path.join(OUTPUT_DIR, "km_plots")
+    os.makedirs(plots_dir, exist_ok=True)
+
+    merged = load_data(EXPRESSION_FILE, SURVIVAL_FILE)
+
+    # Use only desired miRNAs (in order)
+    mirna_cols = [m for m in DESIRED_ORDER if m in merged.columns]
+
+    # Combined figure setup (4x2 grid)
+    fig, axes = plt.subplots(4, 2, figsize=(14, 18))
+    axes = axes.flatten()
+
+    records = []
+
+    for i, mirna in enumerate(mirna_cols):
+        expr_vals = merged[mirna].astype(float)
+        med_val = expr_vals.median()
+
+        df_high = merged[expr_vals > med_val]
+        df_low  = merged[expr_vals <= med_val]
+
+        if len(df_high) == 0 or len(df_low) == 0:
+            continue
+
+        # Log-rank
+        result = logrank_test(
+            df_high[TIME_COL], df_low[TIME_COL],
+            event_observed_A=df_high[EVENT_COL],
+            event_observed_B=df_low[EVENT_COL]
+        )
+        p_val = result.p_value
+
+        # Median OS
+        kmf_high = KaplanMeierFitter().fit(df_high[TIME_COL], df_high[EVENT_COL])
+        kmf_low  = KaplanMeierFitter().fit(df_low[TIME_COL], df_low[EVENT_COL])
+
+        med_high = median_survival(kmf_high)
+        med_low  = median_survival(kmf_low)
+
+        # Save individual plot
+        safe_name = mirna.replace("/", "_")
+        plot_path = os.path.join(plots_dir, f"KM_{safe_name}.png")
+        km_plot(mirna, df_high, df_low, p_val, save_path=plot_path)
+
+        # Add to combined plot
+        km_plot(mirna, df_high, df_low, p_val, ax=axes[i])
+
+        records.append({
+            "miRNA": mirna,
+            "Median_expression": round(med_val, 6),
+            "LogRank_pvalue": round(p_val, 6),
+            "Median_OS_high": med_high,
+            "Median_OS_low": med_low
+        })
+
+        print(f"{mirna} | p={p_val:.4f}")
+
+    # Save combined figure
+    combined_path = os.path.join(OUTPUT_DIR, "KM_all_miRNAs.png")
+    plt.tight_layout()
+    plt.savefig(combined_path, dpi=300)
+    plt.close()
+
+    # Save summary
+    pd.DataFrame(records).to_csv(
+        os.path.join(OUTPUT_DIR, "km_summary.csv"), index=False
+    )
+
+    print("\nDone.")
+    print(f"Combined plot → {combined_path}")
+
+
+if __name__ == "__main__":
+    run_analysis()
