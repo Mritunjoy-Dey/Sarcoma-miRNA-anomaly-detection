@@ -1,0 +1,528 @@
+
+import os
+import warnings
+import numpy as np
+import pandas as pd
+import matplotlib
+import matplotlib.pyplot as plt
+import matplotlib.ticker as ticker
+import seaborn as sns
+from scipy import stats
+def _bh_correction(p_values: np.ndarray) -> tuple:
+    """
+    Benjamini-Hochberg FDR correction implemented with numpy only.
+    Returns (reject, p_adjusted) matching the statsmodels multipletests interface.
+    """
+    n = len(p_values)
+    order = np.argsort(p_values)
+    ranks = np.empty(n, dtype=int)
+    ranks[order] = np.arange(1, n + 1)
+
+    p_adj = np.minimum(1.0, p_values * n / ranks)
+
+    # Enforce monotonicity (cumulative minimum from the largest rank down)
+    p_adj_ordered = p_adj[order]
+    for i in range(n - 2, -1, -1):
+        p_adj_ordered[i] = min(p_adj_ordered[i], p_adj_ordered[i + 1])
+    p_adj[order] = p_adj_ordered
+
+    reject = p_adj < 0.05   # placeholder; actual threshold applied externally
+    return reject, p_adj
+
+warnings.filterwarnings("ignore")
+matplotlib.rcParams["pdf.fonttype"] = 42   # editable text in PDFs
+matplotlib.rcParams["ps.fonttype"]  = 42
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONFIGURATION — edit paths here only
+# ─────────────────────────────────────────────────────────────────────────────
+BASE_DIR    = r"C:\Users\MJ\Desktop\Revised Bioinfo paper data\Normal vs Sarc comparison"
+SARC_FILE   = os.path.join(BASE_DIR, "Sarc_selected_for_normal_comparison_trasn.csv")
+NORMAL_FILE = os.path.join(BASE_DIR, "muscle_samples_selected_microRNA_trans.csv")
+OUT_DIR     = os.path.join(BASE_DIR, "DE_results")
+
+# Thresholds
+FDR_THRESHOLD  = 0.05
+LOG2FC_THRESHOLD = 1.0        # |log2FC| ≥ 1 → 2-fold change in log2 space
+TOP_N_VIOLIN   = 12           # number of top hits to show in violin plot
+TOP_N_HEATMAP  = 50           # rows in heatmap (ranked by adjusted p-value)
+HEATMAP_ZSCORE = True         # z-score rows for heatmap display
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load_transposed_csv(filepath: str, label: str) -> pd.DataFrame:
+    """
+    Load a miRNA expression file where rows = patients, columns = miRNAs.
+    The first column is the patient/sample ID; the header row contains miRNA IDs.
+    Transposes so the returned DataFrame has miRNA_ID as index, patients as columns.
+    """
+    df = pd.read_csv(filepath, sep=None, engine="python", index_col=0)
+    df = df.T                          # miRNAs → rows, patients → columns
+    df.index = df.index.str.strip()
+    df.index.name = "miRNA_ID"
+    df = df.apply(pd.to_numeric, errors="coerce")
+    print(f"[{label}] Loaded: {df.shape[0]} miRNAs × {df.shape[1]} samples")
+    return df
+
+
+def rank_biserial_correlation(u_stat: float, n1: int, n2: int) -> float:
+    """
+    Rank-biserial correlation from Mann-Whitney U statistic.
+    r = 2U/(n1*n2) - 1
+    Ranges from -1 (all normal > sarcoma) to +1 (all sarcoma > normal).
+    Positive r → sarcoma expression tends to be higher.
+    """
+    return (2 * u_stat) / (n1 * n2) - 1
+
+
+def run_mannwhitney(sarcoma_row: np.ndarray,
+                    normal_row:  np.ndarray) -> tuple:
+    """
+    Two-sided Mann-Whitney U test. Returns (U, p-value, rank-biserial r).
+    Falls back gracefully if all values are identical.
+    """
+    try:
+        u_stat, p_val = stats.mannwhitneyu(
+            sarcoma_row, normal_row, alternative="two-sided"
+        )
+        r = rank_biserial_correlation(u_stat, len(sarcoma_row), len(normal_row))
+        return u_stat, p_val, r
+    except ValueError:
+        return np.nan, 1.0, 0.0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN ANALYSIS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def main():
+    os.makedirs(OUT_DIR, exist_ok=True)
+
+    # ── 1. Load data ──────────────────────────────────────────────────────────
+    print("=" * 60)
+    print("SARCOMA vs NORMAL MUSCLE  |  miRNA Differential Expression")
+    print("=" * 60)
+
+    sarc   = load_transposed_csv(SARC_FILE,   "SARCOMA")
+    normal = load_transposed_csv(NORMAL_FILE, "NORMAL")
+
+    # Align to shared miRNAs
+    shared_mirnas = sarc.index.intersection(normal.index)
+    if len(shared_mirnas) == 0:
+        raise ValueError(
+            "No shared miRNA IDs found between the two files. "
+            "Check that IDs are in the same format (e.g. hsa-mir-1 vs hsa-miR-1)."
+        )
+
+    sarc   = sarc.loc[shared_mirnas]
+    normal = normal.loc[shared_mirnas]
+
+    n_sarc   = sarc.shape[1]
+    n_normal = normal.shape[1]
+
+    print(f"\nShared miRNAs : {len(shared_mirnas)}")
+    print(f"Sarcoma samples : {n_sarc}")
+    print(f"Normal samples  : {n_normal}")
+
+    if n_normal < 5:
+        print(
+            f"\n⚠  WARNING: Normal group is very small (n={n_normal}). "
+            "Statistical power is limited. Interpret significant results "
+            "with caution and treat them as exploratory."
+        )
+
+    # Convert to float arrays (rows = miRNAs)
+    sarc_arr   = sarc.values.astype(float)    # shape: (n_mirna, n_sarc)
+    normal_arr = normal.values.astype(float)  # shape: (n_mirna, n_normal)
+
+    # ── 2. Summary statistics ─────────────────────────────────────────────────
+    print("\n── Computing per-miRNA statistics …")
+
+    mean_sarc   = sarc_arr.mean(axis=1)
+    mean_normal = normal_arr.mean(axis=1)
+    std_sarc    = sarc_arr.std(axis=1)
+    std_normal  = normal_arr.std(axis=1)
+    median_sarc   = np.median(sarc_arr, axis=1)
+    median_normal = np.median(normal_arr, axis=1)
+
+    # Log2FC: already log2 data → difference = log of ratio
+    # Median is the primary metric (consistent with Mann-Whitney rank logic)
+    # Mean is retained as a conventional secondary metric
+    log2fc_median = median_sarc - median_normal
+    log2fc_mean   = mean_sarc   - mean_normal
+
+    # ── 3. Mann-Whitney U + effect size ───────────────────────────────────────
+    u_stats, p_vals, rbc_vals = [], [], []
+
+    for i in range(len(shared_mirnas)):
+        u, p, r = run_mannwhitney(sarc_arr[i], normal_arr[i])
+        u_stats.append(u)
+        p_vals.append(p)
+        rbc_vals.append(r)
+
+    u_stats  = np.array(u_stats)
+    p_vals   = np.array(p_vals)
+    rbc_vals = np.array(rbc_vals)
+
+    # ── 4. BH FDR correction ──────────────────────────────────────────────────
+    _, p_adj = _bh_correction(p_vals)
+    reject   = p_adj < FDR_THRESHOLD
+
+    # ── 5. Build results table ────────────────────────────────────────────────
+    results = pd.DataFrame({
+        "miRNA_ID"         : shared_mirnas,
+        "mean_sarcoma"     : mean_sarc,
+        "mean_normal"      : mean_normal,
+        "median_sarcoma"   : median_sarc,
+        "median_normal"    : median_normal,
+        "std_sarcoma"      : std_sarc,
+        "std_normal"       : std_normal,
+        "log2FC_median"    : log2fc_median,   # primary: consistent with Mann-Whitney
+        "log2FC_mean"      : log2fc_mean,     # secondary: conventional reference
+        "U_statistic"      : u_stats,
+        "p_value"          : p_vals,
+        "p_adj_BH"         : p_adj,
+        "rank_biserial_r"  : rbc_vals,
+        "significant"      : reject,
+    }).set_index("miRNA_ID")
+
+    # Direction label (based on median log2FC)
+    results["direction"] = np.where(
+        results["log2FC_median"] > 0, "Up in Sarcoma",
+        np.where(results["log2FC_median"] < 0, "Down in Sarcoma", "No change")
+    )
+
+    # Sort by adjusted p-value
+    results.sort_values("p_adj_BH", inplace=True)
+
+    # Save full table
+    full_path = os.path.join(OUT_DIR, "DE_full_results.csv")
+    results.to_csv(full_path)
+    print(f"  Full results saved → {full_path}")
+
+    # Significant hits (FDR + |median log2FC|)
+    sig = results[
+        (results["p_adj_BH"] < FDR_THRESHOLD) &
+        (results["log2FC_median"].abs() >= LOG2FC_THRESHOLD)
+    ]
+    sig_path = os.path.join(OUT_DIR, "DE_significant_hits.csv")
+    sig.to_csv(sig_path)
+
+    n_up   = (sig["direction"] == "Up in Sarcoma").sum()
+    n_down = (sig["direction"] == "Down in Sarcoma").sum()
+
+    print(f"\n── Significant miRNAs (FDR < {FDR_THRESHOLD}, |log2FC| ≥ {LOG2FC_THRESHOLD}):")
+    print(f"   Total : {len(sig)}")
+    print(f"   Up in sarcoma   : {n_up}")
+    print(f"   Down in sarcoma : {n_down}")
+    print(f"  Significant hits saved → {sig_path}")
+
+    if len(sig) > 0:
+        print("\n  Top 10 significant miRNAs:")
+        print(
+            sig[["log2FC_median", "log2FC_mean", "p_value", "p_adj_BH", "rank_biserial_r"]]
+            .head(10)
+            .to_string(float_format="{:.4f}".format)
+        )
+
+    # ── 6. Plots ──────────────────────────────────────────────────────────────
+    print("\n── Generating plots …")
+    _plot_summary_stats(results, OUT_DIR, FDR_THRESHOLD)
+    _plot_volcano(results, OUT_DIR, FDR_THRESHOLD, LOG2FC_THRESHOLD)
+    _plot_heatmap(sarc, normal, results, OUT_DIR, TOP_N_HEATMAP, HEATMAP_ZSCORE)
+    _plot_violins(sarc, normal, results, OUT_DIR, TOP_N_VIOLIN)
+    _plot_ma(results, OUT_DIR, FDR_THRESHOLD, LOG2FC_THRESHOLD)
+
+    print("\n✓ Analysis complete. All outputs saved to:")
+    print(f"  {OUT_DIR}")
+    print("=" * 60)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PLOT FUNCTIONS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _plot_summary_stats(results: pd.DataFrame, out_dir: str, fdr_thresh: float):
+    """Overview panel: p-value histogram, FC distribution, effect size distribution."""
+    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+    fig.suptitle("Summary Statistics — Sarcoma vs Normal Muscle", fontsize=13, y=1.02)
+
+    # P-value histogram
+    ax = axes[0]
+    ax.hist(results["p_value"], bins=40, color="#4C72B0", edgecolor="white", linewidth=0.4)
+    ax.set_xlabel("Raw p-value (Mann-Whitney)")
+    ax.set_ylabel("Count")
+    ax.set_title("P-value distribution")
+    ax.axvline(fdr_thresh, color="red", linestyle="--", linewidth=1.2, label=f"p={fdr_thresh}")
+    ax.legend(fontsize=9)
+
+    # Log2FC distribution (median-based)
+    ax = axes[1]
+    ax.hist(results["log2FC_median"], bins=40, color="#55A868", edgecolor="white", linewidth=0.4)
+    ax.set_xlabel("log₂ Fold Change — median (Sarcoma − Normal)")
+    ax.set_ylabel("Count")
+    ax.set_title("Log₂FC distribution (median)")
+    ax.axvline(0, color="black", linestyle="-", linewidth=0.8)
+    ax.axvline( 1, color="orange", linestyle="--", linewidth=1, alpha=0.8)
+    ax.axvline(-1, color="orange", linestyle="--", linewidth=1, alpha=0.8, label="|log₂FC|=1")
+    ax.legend(fontsize=9)
+
+    # Rank-biserial correlation
+    ax = axes[2]
+    ax.hist(results["rank_biserial_r"], bins=40, color="#C44E52", edgecolor="white", linewidth=0.4)
+    ax.set_xlabel("Rank-biserial correlation (r)")
+    ax.set_ylabel("Count")
+    ax.set_title("Effect size distribution")
+    ax.axvline(0, color="black", linestyle="-", linewidth=0.8)
+    ax.axvline( 0.3, color="grey", linestyle="--", linewidth=1, alpha=0.7, label="r=±0.3 (small)")
+    ax.axvline(-0.3, color="grey", linestyle="--", linewidth=1, alpha=0.7)
+    ax.legend(fontsize=9)
+
+    plt.tight_layout()
+    path = os.path.join(out_dir, "01_summary_stats.png")
+    fig.savefig(path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Plot saved → {path}")
+
+
+def _plot_volcano(results: pd.DataFrame, out_dir: str,
+                  fdr_thresh: float, fc_thresh: float):
+    """Volcano plot: log2FC vs -log10(adjusted p-value)."""
+    df = results.copy()
+    df["-log10_padj"] = -np.log10(df["p_adj_BH"].clip(lower=1e-300))
+
+    # Colour categories
+    def _category(row):
+        sig = (row["p_adj_BH"] < fdr_thresh) and (abs(row["log2FC_median"]) >= fc_thresh)
+        if not sig:
+            return "NS"
+        return "Up" if row["log2FC_median"] > 0 else "Down"
+
+    df["cat"] = df.apply(_category, axis=1)
+
+    palette = {"NS": "#BBBBBB", "Up": "#D62728", "Down": "#1F77B4"}
+    counts  = df["cat"].value_counts()
+
+    fig, ax = plt.subplots(figsize=(9, 7))
+
+    for cat, colour in palette.items():
+        sub = df[df["cat"] == cat]
+        ax.scatter(
+            sub["log2FC_median"], sub["-log10_padj"],
+            c=colour, s=18, alpha=0.6, linewidths=0,
+            label=f"{cat} (n={counts.get(cat, 0)})"
+        )
+
+    # Threshold lines
+    ax.axhline(-np.log10(fdr_thresh), color="black", linestyle="--",
+               linewidth=0.9, alpha=0.7)
+    ax.axvline( fc_thresh, color="black", linestyle="--", linewidth=0.9, alpha=0.7)
+    ax.axvline(-fc_thresh, color="black", linestyle="--", linewidth=0.9, alpha=0.7)
+
+    # Annotate top 15 significant hits
+    top = df[df["cat"] != "NS"].nsmallest(15, "p_adj_BH")
+    for _, row in top.iterrows():
+        ax.text(
+            row["log2FC_median"], row["-log10_padj"] + 0.05,
+            row.name, fontsize=6.5, ha="center", va="bottom",
+            color="black", fontweight="bold"
+        )
+
+    ax.set_xlabel("log₂ Fold Change — median (Sarcoma − Normal)", fontsize=11)
+    ax.set_ylabel("−log₁₀ (adjusted p-value)", fontsize=11)
+    ax.set_title("Volcano Plot: Sarcoma vs Normal Muscle miRNA Expression", fontsize=12)
+    ax.legend(title="Category", framealpha=0.8, fontsize=9)
+
+    plt.tight_layout()
+    path = os.path.join(out_dir, "02_volcano_plot.png")
+    fig.savefig(path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Plot saved → {path}")
+
+
+def _plot_heatmap(sarc: pd.DataFrame, normal: pd.DataFrame,
+                  results: pd.DataFrame, out_dir: str,
+                  top_n: int, z_score: bool):
+    """Heatmap of top N significant miRNAs, ranked by adjusted p-value."""
+    top_mirnas = results.head(min(top_n, len(results))).index
+
+    sarc_sub   = sarc.loc[top_mirnas]
+    normal_sub = normal.loc[top_mirnas]
+
+    # Combined expression matrix
+    combined = pd.concat([sarc_sub, normal_sub], axis=1)
+
+    # Column colour bar
+    n_s, n_n = sarc_sub.shape[1], normal_sub.shape[1]
+    col_colors = (
+        ["#D62728"] * n_s +   # red = sarcoma
+        ["#1F77B4"] * n_n     # blue = normal
+    )
+
+    # Optional z-score normalisation per row for display
+    if z_score:
+        combined = combined.apply(
+            lambda row: (row - row.mean()) / (row.std() + 1e-9), axis=1
+        )
+        cbar_label = "Row z-score (log₂(x+1))"
+        cmap = "RdBu_r"
+        center = 0
+    else:
+        cbar_label = "log₂(x+1) expression"
+        cmap = "viridis"
+        center = None
+
+    height = max(8, top_n * 0.28)
+    g = sns.clustermap(
+        combined,
+        col_cluster=False,
+        row_cluster=True,
+        col_colors=col_colors,
+        cmap=cmap,
+        center=center,
+        figsize=(14, height),
+        yticklabels=True,
+        xticklabels=False,
+        linewidths=0,
+        cbar_kws={"label": cbar_label, "shrink": 0.4},
+    )
+
+    # Legend for column colours
+    from matplotlib.patches import Patch
+    legend_elements = [
+        Patch(facecolor="#D62728", label=f"Sarcoma (n={n_s})"),
+        Patch(facecolor="#1F77B4", label=f"Normal muscle (n={n_n})"),
+    ]
+    g.ax_heatmap.legend(
+        handles=legend_elements, loc="upper right",
+        bbox_to_anchor=(1.18, 1.05), framealpha=0.8, fontsize=9
+    )
+
+    g.fig.suptitle(
+        f"Top {top_n} miRNAs by adjusted p-value  |  Sarcoma vs Normal Muscle",
+        y=1.01, fontsize=12
+    )
+
+    path = os.path.join(out_dir, "03_heatmap_top_mirnas.png")
+    g.fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(g.fig)
+    print(f"  Plot saved → {path}")
+
+
+def _plot_violins(sarc: pd.DataFrame, normal: pd.DataFrame,
+                  results: pd.DataFrame, out_dir: str, top_n: int):
+    """Violin + strip plots for the top N miRNAs (by adjusted p-value)."""
+    top_mirnas = results.head(min(top_n, len(results))).index
+
+    ncols = 4
+    nrows = int(np.ceil(top_n / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * 4, nrows * 3.5))
+    axes = axes.flatten()
+
+    for idx, mirna in enumerate(top_mirnas):
+        ax = axes[idx]
+
+        s_vals = sarc.loc[mirna].values.astype(float)
+        n_vals = normal.loc[mirna].values.astype(float)
+
+        plot_df = pd.DataFrame({
+            "expression": np.concatenate([s_vals, n_vals]),
+            "group": (["Sarcoma"] * len(s_vals) + ["Normal"] * len(n_vals))
+        })
+
+        sns.violinplot(
+            data=plot_df, x="group", y="expression",
+            palette={"Sarcoma": "#D62728", "Normal": "#1F77B4"},
+            inner=None, cut=0, linewidth=0.8, ax=ax
+        )
+        sns.stripplot(
+            data=plot_df, x="group", y="expression",
+            palette={"Sarcoma": "#8B0000", "Normal": "#00008B"},
+            size=3.5, jitter=True, alpha=0.6, ax=ax
+        )
+
+        row = results.loc[mirna]
+        padj = row["p_adj_BH"]
+        l2fc = row["log2FC_median"]
+        rbc  = row["rank_biserial_r"]
+
+        padj_str = f"{padj:.2e}" if padj < 0.001 else f"{padj:.3f}"
+        ax.set_title(
+            f"{mirna}\nlog₂FC={l2fc:+.2f}  FDR={padj_str}  r={rbc:.2f}",
+            fontsize=8
+        )
+        ax.set_xlabel("")
+        ax.set_ylabel("log₂(x+1)" if idx % ncols == 0 else "")
+        ax.tick_params(labelsize=8)
+
+    # Hide unused subplots
+    for j in range(idx + 1, len(axes)):
+        axes[j].set_visible(False)
+
+    fig.suptitle(
+        f"Top {top_n} miRNAs — Sarcoma vs Normal Muscle Expression",
+        fontsize=12, y=1.01
+    )
+    plt.tight_layout()
+    path = os.path.join(out_dir, "04_violin_top_mirnas.png")
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Plot saved → {path}")
+
+
+def _plot_ma(results: pd.DataFrame, out_dir: str,
+             fdr_thresh: float, fc_thresh: float):
+    """
+    MA plot: average expression (A) vs log2FC (M).
+    Classic DE diagnostic — helps spot expression-level bias.
+    """
+    df = results.copy()
+    # A axis: median expression average (consistent with median-based FC)
+    df["A"] = (df["median_sarcoma"] + df["median_normal"]) / 2
+
+    def _cat(row):
+        sig = (row["p_adj_BH"] < fdr_thresh) and (abs(row["log2FC_median"]) >= fc_thresh)
+        if not sig:
+            return "NS"
+        return "Up" if row["log2FC_median"] > 0 else "Down"
+
+    df["cat"] = df.apply(_cat, axis=1)
+    palette = {"NS": "#BBBBBB", "Up": "#D62728", "Down": "#1F77B4"}
+    counts  = df["cat"].value_counts()
+
+    fig, ax = plt.subplots(figsize=(9, 6))
+    for cat, colour in palette.items():
+        sub = df[df["cat"] == cat]
+        ax.scatter(
+            sub["A"], sub["log2FC_median"],
+            c=colour, s=16, alpha=0.55, linewidths=0,
+            label=f"{cat} (n={counts.get(cat, 0)})"
+        )
+
+    ax.axhline(0, color="black", linewidth=0.9)
+    ax.axhline( fc_thresh, color="black", linestyle="--", linewidth=0.8, alpha=0.6)
+    ax.axhline(-fc_thresh, color="black", linestyle="--", linewidth=0.8, alpha=0.6)
+
+    # Annotate top 10
+    top = df[df["cat"] != "NS"].nsmallest(10, "p_adj_BH")
+    for _, row in top.iterrows():
+        ax.text(row["A"] + 0.02, row["log2FC_median"] + 0.03,
+                row.name, fontsize=6.5, color="black")
+
+    ax.set_xlabel("A  (median log₂ expression across both groups)", fontsize=11)
+    ax.set_ylabel("M  (median log₂ Fold Change, Sarcoma − Normal)", fontsize=11)
+    ax.set_title("MA Plot: Sarcoma vs Normal Muscle miRNA Expression", fontsize=12)
+    ax.legend(title="Category", framealpha=0.8, fontsize=9)
+
+    plt.tight_layout()
+    path = os.path.join(out_dir, "05_MA_plot.png")
+    fig.savefig(path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Plot saved → {path}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    main()
