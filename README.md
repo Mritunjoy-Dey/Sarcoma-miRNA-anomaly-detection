@@ -1,6 +1,9 @@
 # Sarcoma miRNA Anomaly Detection
 ### Description
 >#### One-class anomaly detection framework using miRNA expression data to distinguish sarcoma from other cancer lineages, identify lineage vs oncogenic signals, and uncover prognostic biomarkers.
+>
+><img width="3000" height="2100" alt="Isolation forest pipeline for Bioinformatics research paper" src="https://github.com/user-attachments/assets/b79a5787-6c7b-4b7c-a828-7c97ba600e0f" />
+
 > ----------------------------------------------------------------
 ### Code accompanying the manuscript:
 >#### "miRNA expression differences between sarcoma and other cancer lineages encode distinct biological and clinical signals"
