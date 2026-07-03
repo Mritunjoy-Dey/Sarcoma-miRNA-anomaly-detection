@@ -25,18 +25,7 @@ LOW_COLOR  = "#1F77B4"
 CI_ALPHA   = 0.12
 FIG_DPI    = 150
 
-# Desired order for combined plot
-DESIRED_ORDER = [
-    "hsa-mir-214",
-    "hsa-mir-1245a",
-    "hsa-mir-767",
-    "hsa-mir-1305",
-    "hsa-mir-3152",
-    "hsa-mir-196a",
-    "hsa-mir-337",
-    "hsa-mir-493"
-]
-# ─────────────────────────────────────────────
+
 
 
 def load_data(expr_path, surv_path):
