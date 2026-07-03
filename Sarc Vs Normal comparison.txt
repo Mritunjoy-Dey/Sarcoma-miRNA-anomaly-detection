@@ -36,7 +36,7 @@ matplotlib.rcParams["ps.fonttype"]  = 42
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIGURATION — edit paths here only
 # ─────────────────────────────────────────────────────────────────────────────
-BASE_DIR    = r"C:\Users\MJ\Desktop\Revised Bioinfo paper data\Normal vs Sarc comparison"
+BASE_DIR    = r"C:\PATH\TO\DIR"
 SARC_FILE   = os.path.join(BASE_DIR, "Sarc_selected_for_normal_comparison_trasn.csv")
 NORMAL_FILE = os.path.join(BASE_DIR, "muscle_samples_selected_microRNA_trans.csv")
 OUT_DIR     = os.path.join(BASE_DIR, "DE_results")
