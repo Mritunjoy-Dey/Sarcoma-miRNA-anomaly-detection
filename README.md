@@ -6,7 +6,7 @@
 
 > ----------------------------------------------------------------
 ### Code accompanying the manuscript:
->#### "miRNA expression differences between sarcoma and other cancer lineages encode distinct biological and clinical signals"
+>#### "Cross-Lineage MicroRNA Analysis Defines Conserved Mesenchymal Identity and Prognostic Dysregulation in Sarcoma"
 >#### Dey M, Remiszewski P, Perdas E, Golik P, Piątkowski J & Czarnecka AM
 > -----------------------------------------------------------------
 ### What this study does
