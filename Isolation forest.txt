@@ -32,8 +32,8 @@ np.random.seed(42)
 # ─────────────────────────────────────────────────────────────────────
 # 1.  CONFIGURATION  ←  edit only this block
 # ─────────────────────────────────────────────────────────────────────
-DATA_DIR   = r"PATH\TO\DATA"
-OUTPUT_DIR = r"PATH\TO\DATA"
+DATA_DIR   = r"C:\PATH\TO\DATA"
+OUTPUT_DIR = r"C:\PATH\TO\DATA"
 
 FILES = {
     "Epithelial":     "Epithelial_samples.csv",
