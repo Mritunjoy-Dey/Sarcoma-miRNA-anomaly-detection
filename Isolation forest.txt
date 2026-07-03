@@ -32,14 +32,14 @@ np.random.seed(42)
 # ─────────────────────────────────────────────────────────────────────
 # 1.  CONFIGURATION  ←  edit only this block
 # ─────────────────────────────────────────────────────────────────────
-DATA_DIR   = r"C:\Users\MJ\Desktop\Revised Bioinfo paper data\All data"
-OUTPUT_DIR = r"C:\Users\MJ\Desktop\Revised Bioinfo paper data\Results"
+DATA_DIR   = r"PATH\TO\DATA"
+OUTPUT_DIR = r"PATH\TO\DATA"
 
 FILES = {
-    "Epithelial":     "Epithelial_Selected_Combined.csv",
-    "Haematological": "Haematological_Selected_Combined.csv",
-    "Neurological":   "Neurological_Selected_Combined.csv",
-    "Sarcoma":        "Sarcoma_Selected_Combined.csv",
+    "Epithelial":     "Epithelial_samples.csv",
+    "Haematological": "Haematological_samples.csv",
+    "Neurological":   "Neurological_samples.csv",
+    "Sarcoma":        "Sarcoma_samples.csv",
 }
 
 N_SPLITS     = 5
