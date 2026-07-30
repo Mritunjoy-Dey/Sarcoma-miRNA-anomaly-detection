@@ -1,0 +1,507 @@
+"""
+Fisher LDA miRNA Diagnostic Index — Combinatorial Discovery Pipeline
+=====================================================================
+Replicates the Index VI-style methodology of:
+Asano et al. 2019, Nature Communications, https://doi.org/10.1038/s41467-019-09143-8
+("A serum microRNA classifier for the diagnosis of sarcomas of various
+histological subtypes"), adapted to a two-cohort sarcoma design (TCGA =
+training/fitting sarcoma cohort, GSE36982 = external validation sarcoma
+cohort) sharing a single pooled Normal control dataset that must be split
+across both cohorts.
+
+============================== DESIGN DECISIONS ==============================
+These were deliberately chosen (not defaults left unexamined) — see the
+accompanying chat message for the reasoning behind each one.
+
+1. NORMAL SPLIT: Normal samples are split into a training-pool subset and a
+   validation-pool subset, stratified by GEO Accession_ID (so every GEO
+   series contributes to both pools in proportion to its own size), with the
+   overall train:validation ratio set equal to the ratio of TCGA sarcoma n
+   to GSE36982 sarcoma n (computed dynamically from your files).
+
+2. CLASS IMBALANCE: handled via EQUAL LDA priors (0.5 / 0.5), not resampling.
+   This keeps every real sample in the model (no downsampling) and doesn't
+   fabricate synthetic samples (no SMOTE). Balanced accuracy is reported
+   alongside raw sensitivity/specificity/accuracy for transparency.
+
+3. COMBO / INDEX-SIZE SELECTION CRITERION: AUC, matching the paper exactly.
+   For each panel size k = 2..7, every C(7,k) combination of the 7
+   candidate miRNAs is evaluated by Fisher's LDA + Leave-One-Out
+   Cross-Validation (LOOCV) on the training pool only. The best (highest
+   AUC) combination at each size is kept.
+   The FINAL index size is the smallest k whose best LOOCV AUC is within
+   PLATEAU_EPS of the maximum AUC achieved across all sizes 2-7 — i.e. the
+   same "stop adding markers once performance plateaus" logic the paper
+   used to prefer Index VI (7 markers) over larger 8- and 9-marker indices
+   that added no further gain.
+
+4. THRESHOLD: fixed at decision_function >= 0 -> sarcoma, identical to the
+   paper's convention. This falls out automatically from priors = 0.5/0.5.
+
+5. ZERO-VALUE HANDLING: a value of 0 is treated as "undetected" and imputed
+   with half the minimum observed positive value for that miRNA (computed
+   across the full combined dataset: Normal + TCGA + GSE36982), echoing the
+   paper's below-detection floor approach. A log2 transform is applied only
+   if the data is auto-detected to still be on a raw/linear scale (99th
+   percentile > 30); if your data is already log-normalized this is skipped
+   automatically and a message is printed either way — check the console
+   output to confirm the right branch was taken.
+
+6. NO PEEKING: the combinatorial search and index-size selection are done
+   ENTIRELY on the training pool (TCGA + Normal-train). The GSE36982 +
+   Normal-val validation pool is touched exactly once, at the very end,
+   with the single frozen formula — never used to pick markers or panel size.
+
+7. SINGLE-MARKER (INDIVIDUAL) REPORTING: in addition to the combinatorial
+   search over panel sizes 2-7, every one of the 7 candidate miRNAs is ALSO
+   evaluated completely on its own (single-feature Fisher LDA + LOOCV on the
+   training pool, then one frozen application to the validation pool). This
+   is purely for reporting/comparison — it does NOT feed into or change the
+   panel-size selection logic in (3) above, which still starts at k=2. If
+   you'd rather have single markers compete for the "final index" slot too,
+   set MIN_K = 1 below and the combinatorial loop will include them; the
+   dedicated single-marker section will still run either way and gives you
+   the full breakdown (formula + train/val metrics) for all 7 individually.
+================================================================================
+"""
+
+import os
+import json
+import itertools
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
+from sklearn.model_selection import LeaveOneOut
+from sklearn.metrics import roc_auc_score, roc_curve
+
+# ----------------------------- CONFIG -----------------------------
+BASE = r"C:\PATH\TO\BASE\FOLDER"
+OUT = os.path.join(BASE, "PATH")
+os.makedirs(OUT, exist_ok=True)
+
+NORMAL_FILE = os.path.join(BASE, "Normal.csv")
+TCGA_FILE = os.path.join(BASE, "Sarcoma_train.csv")
+GSE_FILE = os.path.join(BASE, "Sarcoma_validation.csv")
+META_FILE = os.path.join(BASE, "Alignment_metadata_Normal.csv")
+
+MARKERS = ["hsa-mir-196a", "hsa-mir-214", "hsa-mir-767", "hsa-mir-1245a",
+           "hsa-mir-1305", "hsa-mir-337", "hsa-mir-493"]
+
+RANDOM_SEED = 42
+PLATEAU_EPS = 0.005     # AUC improvement smaller than this = "no real gain"
+MIN_K, MAX_K = 2, 7    # combinatorial index search range (see design decision 7)
+
+rng = np.random.RandomState(RANDOM_SEED)
+
+# ----------------------------- LOAD -----------------------------
+def load(path):
+    df = pd.read_csv(path)
+    missing = [m for m in MARKERS if m not in df.columns]
+    if missing:
+        raise ValueError(f"{path} is missing expected columns: {missing}")
+    return df
+
+normal = load(NORMAL_FILE)
+tcga = load(TCGA_FILE)
+gse = load(GSE_FILE)
+
+meta = pd.read_csv(META_FILE)
+meta = meta.iloc[:, :2]
+meta.columns = ["Patient_ID", "Accession_ID"]
+
+normal = normal.merge(meta, on="Patient_ID", how="left")
+if normal["Accession_ID"].isna().any():
+    missing_ids = normal.loc[normal["Accession_ID"].isna(), "Patient_ID"].tolist()
+    raise ValueError(
+        f"{len(missing_ids)} normal samples have no Accession_ID match in "
+        f"{META_FILE}. First few: {missing_ids[:10]}"
+    )
+
+print(f"Loaded: TCGA sarcoma n={len(tcga)}, GSE36982 sarcoma n={len(gse)}, "
+      f"Normal n={len(normal)} across {normal['Accession_ID'].nunique()} accessions")
+
+# ------------------- ZERO-HANDLING + LOG TRANSFORM -------------------
+combined_raw = pd.concat([normal[MARKERS], tcga[MARKERS], gse[MARKERS]], axis=0)
+
+auto_log = combined_raw.replace(0, np.nan).quantile(0.99).max() > 30
+print(f"Auto-detected {'LINEAR' if auto_log else 'LOG'} scale data -> "
+      f"{'applying' if auto_log else 'skipping'} log2 transform "
+      f"(inspect this line before trusting downstream results)")
+
+floors = {}
+for m in MARKERS:
+    pos = combined_raw[m][combined_raw[m] > 0]
+    floors[m] = float(pos.min() / 2.0) if len(pos) else 1e-3
+
+def impute_and_transform(df):
+    out = df.copy()
+    for m in MARKERS:
+        col = out[m].astype(float)
+        col = col.where(col > 0, floors[m])
+        if auto_log:
+            col = np.log2(col)
+        out[m] = col
+    return out
+
+normal = impute_and_transform(normal)
+tcga = impute_and_transform(tcga)
+gse = impute_and_transform(gse)
+
+# ------------------- SPLIT NORMAL BY ACCESSION -------------------
+train_frac = len(tcga) / (len(tcga) + len(gse))
+print(f"Normal split target: {train_frac:.3f} train / {1 - train_frac:.3f} "
+      f"validation (proportional to TCGA n={len(tcga)} vs GSE36982 n={len(gse)})")
+
+train_rows, val_rows = [], []
+singleton_groups = []
+running_train, running_val = 0, 0
+
+for acc, grp in normal.groupby("Accession_ID"):
+    grp = grp.sample(frac=1, random_state=RANDOM_SEED)  # shuffle within group
+    n = len(grp)
+    if n >= 2:
+        n_train = max(1, min(n - 1, round(n * train_frac)))
+        tr, va = grp.iloc[:n_train], grp.iloc[n_train:]
+        train_rows.append(tr)
+        val_rows.append(va)
+        running_train += len(tr)
+        running_val += len(va)
+    else:
+        singleton_groups.append(grp)
+
+# Greedily assign singleton-accession samples to keep the overall ratio on target
+for grp in singleton_groups:
+    current_frac = running_train / max(1, (running_train + running_val))
+    if current_frac < train_frac:
+        train_rows.append(grp)
+        running_train += 1
+    else:
+        val_rows.append(grp)
+        running_val += 1
+
+normal_train = pd.concat(train_rows, axis=0).reset_index(drop=True)
+normal_val = pd.concat(val_rows, axis=0).reset_index(drop=True)
+
+split_check = normal.groupby("Accession_ID").apply(
+    lambda g: pd.Series({
+        "n_total": len(g),
+        "n_train": g["Patient_ID"].isin(normal_train["Patient_ID"]).sum(),
+        "n_val": g["Patient_ID"].isin(normal_val["Patient_ID"]).sum(),
+    })
+).reset_index()
+split_check.to_csv(os.path.join(OUT, "normal_split_by_accession.csv"), index=False)
+print(f"Normal split done: train n={len(normal_train)}, val n={len(normal_val)} "
+      f"(per-accession breakdown saved to normal_split_by_accession.csv)")
+
+# ----------------------------- BUILD POOLS -----------------------------
+tcga = tcga.assign(label=1)
+gse = gse.assign(label=1)
+normal_train = normal_train.assign(label=0)
+normal_val = normal_val.assign(label=0)
+
+train_pool = pd.concat(
+    [tcga[MARKERS + ["label", "Patient_ID"]],
+     normal_train[MARKERS + ["label", "Patient_ID"]]],
+    axis=0
+).reset_index(drop=True)
+
+val_pool = pd.concat(
+    [gse[MARKERS + ["label", "Patient_ID"]],
+     normal_val[MARKERS + ["label", "Patient_ID"]]],
+    axis=0
+).reset_index(drop=True)
+
+train_pool.to_csv(os.path.join(OUT, "training_pool.csv"), index=False)
+val_pool.to_csv(os.path.join(OUT, "validation_pool.csv"), index=False)
+
+X_train_full = train_pool[MARKERS].values
+y_train_full = train_pool["label"].values
+X_val = val_pool[MARKERS].values
+y_val = val_pool["label"].values
+
+print(f"Training pool: n={len(train_pool)} "
+      f"(sarcoma={int(y_train_full.sum())}, normal={int(len(y_train_full) - y_train_full.sum())})")
+print(f"Validation pool: n={len(val_pool)} "
+      f"(sarcoma={int(y_val.sum())}, normal={int(len(y_val) - y_val.sum())})")
+
+# ----------------------------- METRICS -----------------------------
+def compute_metrics(y_true, y_score, threshold=0.0):
+    y_true = np.asarray(y_true)
+    y_pred = (y_score >= threshold).astype(int)
+    tp = np.sum((y_pred == 1) & (y_true == 1))
+    tn = np.sum((y_pred == 0) & (y_true == 0))
+    fp = np.sum((y_pred == 1) & (y_true == 0))
+    fn = np.sum((y_pred == 0) & (y_true == 1))
+    sens = tp / (tp + fn) if (tp + fn) else np.nan
+    spec = tn / (tn + fp) if (tn + fp) else np.nan
+    ppv = tp / (tp + fp) if (tp + fp) else np.nan
+    npv = tn / (tn + fn) if (tn + fn) else np.nan
+    acc = (tp + tn) / len(y_true)
+    bal_acc = (sens + spec) / 2
+    auc = roc_auc_score(y_true, y_score) if len(np.unique(y_true)) > 1 else np.nan
+    return dict(sensitivity=sens, specificity=spec, ppv=ppv, npv=npv,
+                accuracy=acc, balanced_accuracy=bal_acc, auc=auc)
+
+def format_formula(markers, coef, intercept):
+    terms = " + ".join(f"({c:.4f} * {mk})" for c, mk in zip(coef, markers))
+    return f"Index = {terms} + ({intercept:.4f})"
+
+# ------------------- COMBINATORIAL LOOCV SEARCH (TRAIN POOL ONLY) -------------------
+loo = LeaveOneOut()
+best_by_size = {}
+
+print("\nRunning combinatorial LOOCV search across panel sizes "
+      f"{MIN_K}-{MAX_K} (training pool only — validation pool is not touched)...")
+for k in range(MIN_K, MAX_K + 1):
+    best_auc = -np.inf
+    best_result = None
+    for combo in itertools.combinations(MARKERS, k):
+        idx = [MARKERS.index(m) for m in combo]
+        Xk = X_train_full[:, idx]
+        scores = np.zeros(len(y_train_full))
+        for tr_idx, te_idx in loo.split(Xk):
+            clf = LinearDiscriminantAnalysis(priors=[0.5, 0.5])
+            clf.fit(Xk[tr_idx], y_train_full[tr_idx])
+            scores[te_idx] = clf.decision_function(Xk[te_idx])
+        m = compute_metrics(y_train_full, scores, threshold=0.0)
+        if m["auc"] > best_auc:
+            best_auc = m["auc"]
+            best_result = dict(combo=combo, metrics=m, scores=scores)
+    best_by_size[k] = best_result
+    mt = best_result["metrics"]
+    print(f"  size {k}: best combo={best_result['combo']}  "
+          f"AUC={mt['auc']:.4f}  sens={mt['sensitivity']:.3f}  "
+          f"spec={mt['specificity']:.3f}  bal_acc={mt['balanced_accuracy']:.3f}")
+
+# Fit each size's best combo on the FULL training pool (needed only to report the
+# frozen formula for every size — does NOT change which size is finally selected)
+for k, res in best_by_size.items():
+    idxk = [MARKERS.index(m) for m in res["combo"]]
+    clf_k = LinearDiscriminantAnalysis(priors=[0.5, 0.5])
+    clf_k.fit(X_train_full[:, idxk], y_train_full)
+    res["coef"] = clf_k.coef_[0]
+    res["intercept"] = clf_k.intercept_[0]
+
+# ------------------- SINGLE-MARKER (INDIVIDUAL) EVALUATION -------------------
+# Every one of the 7 candidate miRNAs evaluated completely on its own: LOOCV on
+# the training pool, then a single frozen application to the validation pool.
+# This is reporting-only and does not affect the combinatorial search above.
+print("\nEvaluating each miRNA individually (single-feature LDA, LOOCV on "
+      "training pool, single frozen application to validation pool)...")
+single_marker_results = {}
+for m in MARKERS:
+    idx1 = [MARKERS.index(m)]
+    Xk = X_train_full[:, idx1]
+    scores = np.zeros(len(y_train_full))
+    for tr_idx, te_idx in loo.split(Xk):
+        clf = LinearDiscriminantAnalysis(priors=[0.5, 0.5])
+        clf.fit(Xk[tr_idx], y_train_full[tr_idx])
+        scores[te_idx] = clf.decision_function(Xk[te_idx])
+    loocv_metrics = compute_metrics(y_train_full, scores, threshold=0.0)
+
+    # Freeze the single-marker formula on the full training pool
+    clf_full = LinearDiscriminantAnalysis(priors=[0.5, 0.5])
+    clf_full.fit(Xk, y_train_full)
+    coef1 = clf_full.coef_[0][0]
+    intercept1 = clf_full.intercept_[0]
+
+    # Single, cold application to the validation pool
+    val_scores1 = clf_full.decision_function(X_val[:, idx1])
+    val_metrics = compute_metrics(y_val, val_scores1, threshold=0.0)
+
+    single_marker_results[m] = dict(
+        loocv_scores=scores, loocv_metrics=loocv_metrics,
+        coef=coef1, intercept=intercept1,
+        val_scores=val_scores1, val_metrics=val_metrics,
+    )
+    print(f"  {m}: Training LOOCV AUC={loocv_metrics['auc']:.4f}  "
+          f"sens={loocv_metrics['sensitivity']:.3f}  spec={loocv_metrics['specificity']:.3f}  "
+          f"|  Validation AUC={val_metrics['auc']:.4f}  "
+          f"sens={val_metrics['sensitivity']:.3f}  spec={val_metrics['specificity']:.3f}")
+
+# ------------------- SELECT FINAL SIZE (plateau / parsimony logic) -------------------
+aucs = {k: best_by_size[k]["metrics"]["auc"] for k in best_by_size}
+max_auc = max(aucs.values())
+final_k = min(k for k, a in aucs.items() if a >= max_auc - PLATEAU_EPS)
+final_combo = best_by_size[final_k]["combo"]
+print(f"\nSelected final index: size={final_k}, markers={final_combo}")
+print(f"(max LOOCV AUC across all sizes {MIN_K}-{MAX_K} = {max_auc:.4f}; "
+      f"plateau tolerance = {PLATEAU_EPS}; smallest panel within tolerance was chosen)")
+
+# ------------------- FREEZE FORMULA (fit once on full training pool) -------------------
+idx = [MARKERS.index(m) for m in final_combo]
+Xk_full = X_train_full[:, idx]
+final_clf = LinearDiscriminantAnalysis(priors=[0.5, 0.5])
+final_clf.fit(Xk_full, y_train_full)
+
+coef = final_clf.coef_[0]
+intercept = final_clf.intercept_[0]
+
+formula_str = format_formula(final_combo, coef, intercept)
+print(f"\nFrozen formula:\n{formula_str}")
+print("Rule: Index >= 0 -> sarcoma; Index < 0 -> normal")
+
+with open(os.path.join(OUT, "frozen_formula.json"), "w") as f:
+    json.dump({
+        "markers": list(final_combo),
+        "coefficients": coef.tolist(),
+        "intercept": float(intercept),
+        "threshold_rule": "Index >= 0 -> sarcoma; Index < 0 -> normal",
+        "log2_transform_applied": bool(auto_log),
+        "zero_imputation_floors": floors,
+        "priors": [0.5, 0.5],
+        "size_selection": {
+            "criterion": "AUC",
+            "plateau_epsilon": PLATEAU_EPS,
+            "max_auc_all_sizes": max_auc,
+            "chosen_size": final_k,
+            "auc_by_size": aucs,
+        },
+        "normal_split": {
+            "train_frac_target": train_frac,
+            "n_normal_train": len(normal_train),
+            "n_normal_val": len(normal_val),
+        },
+        "single_markers": {
+            m: {
+                "coefficient": float(r["coef"]),
+                "intercept": float(r["intercept"]),
+                "training_loocv_auc": r["loocv_metrics"]["auc"],
+                "validation_auc": r["val_metrics"]["auc"],
+            } for m, r in single_marker_results.items()
+        },
+    }, f, indent=2)
+
+with open(os.path.join(OUT, "frozen_formula.txt"), "w") as f:
+    f.write(formula_str + "\nRule: Index >= 0 -> sarcoma; Index < 0 -> normal\n")
+
+# ------------------- ALL FORMULAE, ONE FILE (single markers + every panel size) -------------------
+with open(os.path.join(OUT, "all_index_formulas.txt"), "w") as f:
+    f.write("ALL INDEX FORMULAE (single miRNAs + best combination at each panel size)\n")
+    f.write("=" * 78 + "\n")
+    f.write("Rule for every formula below: Index >= 0 -> sarcoma; Index < 0 -> normal\n")
+    f.write("All formulas are frozen on the FULL training pool (TCGA + Normal-train).\n\n")
+
+    f.write("-- SIZE 1 (individual miRNAs, evaluated separately from the combinatorial search) --\n")
+    for m in MARKERS:
+        r = single_marker_results[m]
+        formula = format_formula([m], [r["coef"]], r["intercept"])
+        f.write(
+            f"{m}\n"
+            f"  {formula}\n"
+            f"  Training LOOCV: AUC={r['loocv_metrics']['auc']:.4f}  "
+            f"sens={r['loocv_metrics']['sensitivity']:.3f}  spec={r['loocv_metrics']['specificity']:.3f}\n"
+            f"  Validation (external, single application): AUC={r['val_metrics']['auc']:.4f}  "
+            f"sens={r['val_metrics']['sensitivity']:.3f}  spec={r['val_metrics']['specificity']:.3f}\n\n"
+        )
+
+    f.write(f"-- BEST COMBINATION AT EACH SIZE {MIN_K}-{MAX_K} --\n")
+    for k in sorted(best_by_size.keys()):
+        res = best_by_size[k]
+        formula = format_formula(res["combo"], res["coef"], res["intercept"])
+        tag = "  <-- SELECTED AS FINAL INDEX" if k == final_k else ""
+        f.write(
+            f"Size {k}: {', '.join(res['combo'])}{tag}\n"
+            f"  {formula}\n"
+            f"  Training LOOCV: AUC={res['metrics']['auc']:.4f}  "
+            f"sens={res['metrics']['sensitivity']:.3f}  spec={res['metrics']['specificity']:.3f}\n\n"
+        )
+
+    f.write("-- FINAL SELECTED INDEX (same formula also saved on its own in frozen_formula.txt) --\n")
+    f.write(f"Size {final_k}: {', '.join(final_combo)}\n")
+    f.write(f"  {formula_str}\n")
+
+# ------------------- INTERNAL (LOOCV) PERFORMANCE OF FINAL INDEX -------------------
+internal_scores = best_by_size[final_k]["scores"]
+internal_metrics = compute_metrics(y_train_full, internal_scores, threshold=0.0)
+
+# ------------------- EXTERNAL VALIDATION (single, cold application) -------------------
+Xk_val = X_val[:, idx]
+val_scores = final_clf.decision_function(Xk_val)
+external_metrics = compute_metrics(y_val, val_scores, threshold=0.0)
+
+print(f"\nInternal (LOOCV, training pool) performance:  {internal_metrics}")
+print(f"External (validation pool, single application) performance: {external_metrics}")
+
+# ------------------- SAVE PAPER-STYLE PERFORMANCE TABLE -------------------
+rows = []
+for m in MARKERS:
+    r = single_marker_results[m]
+    rows.append({"index_size": 1, "markers": m,
+                  "set": "Training (LOOCV)", **r["loocv_metrics"]})
+    rows.append({"index_size": 1, "markers": m,
+                  "set": "Validation (external, single application)", **r["val_metrics"]})
+for k, res in best_by_size.items():
+    rows.append({"index_size": k, "markers": ", ".join(res["combo"]),
+                  "set": "Training (LOOCV)", **res["metrics"]})
+rows.append({"index_size": final_k, "markers": ", ".join(final_combo),
+             "set": "Validation (external, single application)", **external_metrics})
+table2 = pd.DataFrame(rows)
+table2.to_csv(os.path.join(OUT, "performance_table.csv"), index=False)
+
+train_pool["decision_score"] = internal_scores
+train_pool.to_csv(os.path.join(OUT, "training_pool_with_scores.csv"), index=False)
+
+val_pool["decision_score"] = val_scores
+val_pool.to_csv(os.path.join(OUT, "validation_pool_with_scores.csv"), index=False)
+
+# ----------------------------- PLOTS -----------------------------
+fig, axes = plt.subplots(1, 2, figsize=(11, 5))
+
+fpr_t, tpr_t, _ = roc_curve(y_train_full, internal_scores)
+axes[0].plot(fpr_t, tpr_t, color="red")
+axes[0].plot([0, 1], [0, 1], "k--")
+axes[0].set_title(f"Training (LOOCV) ROC\nAUC={internal_metrics['auc']:.3f}")
+axes[0].set_xlabel("1 - Specificity")
+axes[0].set_ylabel("Sensitivity")
+
+fpr_v, tpr_v, _ = roc_curve(y_val, val_scores)
+axes[1].plot(fpr_v, tpr_v, color="red")
+axes[1].plot([0, 1], [0, 1], "k--")
+axes[1].set_title(f"Validation ROC\nAUC={external_metrics['auc']:.3f}")
+axes[1].set_xlabel("1 - Specificity")
+axes[1].set_ylabel("Sensitivity")
+
+plt.tight_layout()
+plt.savefig(os.path.join(OUT, "roc_curves.png"), dpi=200)
+plt.close()
+
+plt.figure(figsize=(6, 4))
+ks_sorted = sorted(aucs.keys())
+plt.plot(ks_sorted, [aucs[k] for k in ks_sorted], marker="o")
+plt.axvline(final_k, color="red", linestyle="--", label=f"selected size = {final_k}")
+plt.xlabel("Number of miRNAs in index")
+plt.ylabel("LOOCV AUC (training pool)")
+plt.title("Index size vs. performance")
+plt.legend()
+plt.tight_layout()
+plt.savefig(os.path.join(OUT, "auc_vs_index_size.png"), dpi=200)
+plt.close()
+
+# Single-miRNA AUC bar chart (training LOOCV vs. external validation)
+plt.figure(figsize=(9, 5))
+x = np.arange(len(MARKERS))
+width = 0.35
+train_single_aucs = [single_marker_results[m]["loocv_metrics"]["auc"] for m in MARKERS]
+val_single_aucs = [single_marker_results[m]["val_metrics"]["auc"] for m in MARKERS]
+plt.bar(x - width / 2, train_single_aucs, width, label="Training (LOOCV)", color="steelblue")
+plt.bar(x + width / 2, val_single_aucs, width, label="Validation (external)", color="indianred")
+plt.axhline(0.5, color="gray", linestyle="--", linewidth=1, label="chance (AUC=0.5)")
+plt.xticks(x, MARKERS, rotation=45, ha="right")
+plt.ylabel("AUC")
+plt.ylim(0, 1)
+plt.title("Diagnostic AUC of individual miRNAs (single-marker LDA)")
+plt.legend()
+plt.tight_layout()
+plt.savefig(os.path.join(OUT, "single_mirna_auc.png"), dpi=200)
+plt.close()
+
+print(f"\nAll outputs saved to: {OUT}")
+print("Files written: normal_split_by_accession.csv, training_pool.csv, "
+      "validation_pool.csv, frozen_formula.json/.txt, all_index_formulas.txt, "
+      "performance_table.csv, training_pool_with_scores.csv, "
+      "validation_pool_with_scores.csv, roc_curves.png, auc_vs_index_size.png, "
+      "single_mirna_auc.png")
