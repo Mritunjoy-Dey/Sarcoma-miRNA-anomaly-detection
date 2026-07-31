@@ -1,0 +1,218 @@
+"""
+Cross-platform miRNA normalization pipeline
+=============================================
+Harmonizes three datasets measured on different technologies so they become
+comparable on a relative (z-score) scale:
+
+   
+"""
+
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.decomposition import PCA
+
+
+# ============================== CONFIG ======================================
+
+INPUT_DIR = r"C:\Users\MJ\Desktop\BIO-INFO paper Revision work\Manual\Sarcoma_and_Normal_sample_processed\Processed"
+OUTPUT_DIR = os.path.join(INPUT_DIR, "claude")
+
+SARC1_FILE = "Sarcoma_selected_miRNAs_3152_removed.csv"          # TCGA-SARC, tumor only
+SARC2_FILE = "GSE36982_selected_miRNAs_3152_removed.csv"         # GSE36982, tumor only
+NORMAL_FILE = "Normal_miRNA_expression_combined_3152_removed.csv"
+META_FILE = "Alignment_metadata_Normal_miRNA_expression_combined_3152_removed.csv"
+
+SARC1_LABEL = "TCGA-SARC"
+SARC2_LABEL = "GSE36982"
+
+# Which normal accession, within the pooled normal file, supplies the
+# z-score baseline for each tumor-only dataset. Edit if your domain
+# knowledge says otherwise.
+BASELINE_SOURCE = {
+    SARC1_LABEL: "TCGA-UCEC",   # same Xena/RNA-seq pipeline
+    SARC2_LABEL: "GSE36982",    # same array platform
+}
+
+# Below this many normal samples in a batch, don't trust that batch's own
+# SD -- borrow SD (not mean) from the largest available normal batch.
+MIN_N_FOR_OWN_SD = 5
+
+# Values above this (95th percentile within a batch) are assumed to be on
+# a linear scale and get log2(x+1) transformed. Batches already log-scaled
+# (typically max ~15-ish for these platforms) are left alone.
+LINEAR_SCALE_THRESHOLD = 50
+
+RANDOM_STATE = 42
+
+# ==============================================================================
+
+
+def get_mirna_cols(df, id_cols):
+    return [c for c in df.columns if c not in id_cols]
+
+
+def log2_harmonize(df, mirna_cols, group_col, label=""):
+    """Auto-detect linear-scale batches and log2(x+1) transform them."""
+    df = df.copy()
+    for g, idx in df.groupby(group_col).groups.items():
+        sub = df.loc[idx, mirna_cols]
+        p95 = np.nanpercentile(sub.values, 95)
+        if p95 > LINEAR_SCALE_THRESHOLD:
+            df.loc[idx, mirna_cols] = np.log2(sub.clip(lower=0) + 1)
+            print(f"[log2]   {label}{g}: detected linear scale (95th pct={p95:.1f}) -> log2(x+1) applied")
+        else:
+            print(f"[log2]   {label}{g}: already log-scale (95th pct={p95:.1f}) -> left as is")
+    return df
+
+
+def compute_baselines(normal_df, mirna_cols, batch_col):
+    """Per-batch, per-gene mean/SD computed from normal samples only.
+    Small batches borrow SD from the largest normal batch (mean-only shrinkage)."""
+    sizes = normal_df[batch_col].value_counts()
+    ref_batch = sizes.idxmax()
+    ref_sd = normal_df.loc[normal_df[batch_col] == ref_batch, mirna_cols].std(ddof=1)
+    print(f"\n[baseline] Reference batch for SD-shrinkage: {ref_batch} (n={sizes.max()})\n")
+
+    baselines = {}
+    for b, n in sizes.items():
+        sub = normal_df.loc[normal_df[batch_col] == b, mirna_cols]
+        mean_b = sub.mean()
+        if n >= MIN_N_FOR_OWN_SD:
+            sd_b = sub.std(ddof=1)
+            shrunk = False
+        else:
+            sd_b = ref_sd.copy()
+            shrunk = True
+        sd_b = sd_b.replace(0, np.nan)  # guard against zero-variance genes
+        baselines[b] = {"mean": mean_b, "sd": sd_b, "n": n, "shrunk": shrunk}
+        flag = f"(n={n}, SD borrowed from {ref_batch})" if shrunk else f"(n={n}, own SD)"
+        print(f"[baseline] {b}: {flag}")
+    return baselines
+
+
+def zscore_with_baseline(df, mirna_cols, mean_s, sd_s):
+    return (df[mirna_cols] - mean_s) / sd_s
+
+
+def main():
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    # ---------- Load ----------
+    sarc1 = pd.read_csv(os.path.join(INPUT_DIR, SARC1_FILE))
+    sarc2 = pd.read_csv(os.path.join(INPUT_DIR, SARC2_FILE))
+    normal = pd.read_csv(os.path.join(INPUT_DIR, NORMAL_FILE))
+    meta = pd.read_csv(os.path.join(INPUT_DIR, META_FILE))
+
+    id_cols_guess = {"Patient_ID", "Patient_sample", "Accession_ID"}
+    mirna_cols = get_mirna_cols(sarc1, id_cols_guess & set(sarc1.columns))
+    print("Detected miRNA columns:", mirna_cols, "\n")
+
+    # ---------- Tag batch/group ----------
+    sarc1["Accession_ID"] = SARC1_LABEL
+    sarc1["Group"] = "Tumor"
+
+    sarc2["Accession_ID"] = SARC2_LABEL
+    sarc2["Group"] = "Tumor"
+
+    normal = normal.merge(meta, on="Patient_ID", how="left")
+    if normal["Accession_ID"].isnull().any():
+        missing = normal.loc[normal["Accession_ID"].isnull(), "Patient_ID"].tolist()
+        print(f"WARNING: {len(missing)} normal samples had no accession match in metadata: {missing}")
+    normal["Group"] = "Normal"
+
+    # ---------- Combine everything into one working table ----------
+    all_df = pd.concat([sarc1, sarc2, normal], ignore_index=True, sort=False)
+    all_df = all_df[["Patient_ID", "Accession_ID", "Group"] + mirna_cols]
+
+    raw_snapshot = all_df.copy()  # keep pre-normalization copy for PCA "before"
+
+    # ---------- Log2 harmonize (per batch, using all samples in that batch) ----------
+    all_df = log2_harmonize(all_df, mirna_cols, "Accession_ID")
+
+    # ---------- Compute baselines from NORMAL samples per accession ----------
+    normal_only = all_df[all_df["Group"] == "Normal"]
+    baselines = compute_baselines(normal_only, mirna_cols, "Accession_ID")
+
+    # ---------- Apply z-score using each batch's (possibly borrowed) baseline ----------
+    print()
+    z_parts = []
+    for acc, sub in all_df.groupby("Accession_ID"):
+        baseline_key = BASELINE_SOURCE.get(acc, acc)
+        if baseline_key not in baselines:
+            raise ValueError(
+                f"No normal baseline found for '{baseline_key}' (needed for batch '{acc}'). "
+                f"Available normal baselines: {list(baselines.keys())}"
+            )
+        b = baselines[baseline_key]
+        note = f"(borrowed from {baseline_key})" if baseline_key != acc else "(own baseline)"
+        print(f"[zscore] {acc}: n={len(sub)} {note}")
+        z_vals = zscore_with_baseline(sub, mirna_cols, b["mean"], b["sd"])
+        z_vals[["Patient_ID", "Accession_ID", "Group"]] = sub[["Patient_ID", "Accession_ID", "Group"]].values
+        z_parts.append(z_vals)
+
+    normalized_df = pd.concat(z_parts, ignore_index=True)
+    normalized_df = normalized_df[["Patient_ID", "Accession_ID", "Group"] + mirna_cols]
+
+    # ---------- Split back into the three original files ----------
+    out_sarc1 = normalized_df[normalized_df["Accession_ID"] == SARC1_LABEL].drop(columns=["Accession_ID", "Group"])
+    out_sarc2 = normalized_df[normalized_df["Accession_ID"] == SARC2_LABEL].drop(columns=["Accession_ID", "Group"])
+    out_normal = normalized_df[normalized_df["Group"] == "Normal"].drop(columns=["Group"])
+
+    out_sarc1.to_csv(os.path.join(OUTPUT_DIR, "Sarcoma_TCGA_normalized.csv"), index=False)
+    out_sarc2.to_csv(os.path.join(OUTPUT_DIR, "Sarcoma_GSE36982_normalized.csv"), index=False)
+    out_normal.to_csv(os.path.join(OUTPUT_DIR, "Normal_combined_normalized.csv"), index=False)
+    normalized_df.to_csv(os.path.join(OUTPUT_DIR, "All_samples_normalized_long.csv"), index=False)
+
+    # log normalization parameters for reproducibility (e.g. to transform future new samples)
+    param_rows = []
+    for acc, b in baselines.items():
+        for g in mirna_cols:
+            param_rows.append({
+                "Accession_ID": acc, "miRNA": g,
+                "baseline_mean": b["mean"][g], "baseline_sd": b["sd"][g],
+                "n_normal_samples": b["n"], "sd_shrunk": b["shrunk"],
+            })
+    pd.DataFrame(param_rows).to_csv(os.path.join(OUTPUT_DIR, "normalization_parameters.csv"), index=False)
+
+    # ---------- PCA before / after ----------
+    def pca_plot(df, mirna_cols, title, fname):
+        X = df[mirna_cols].dropna()
+        keep_idx = X.index
+        pca = PCA(n_components=2, random_state=RANDOM_STATE)
+        coords = pca.fit_transform(X.values)
+        plot_df = df.loc[keep_idx, ["Accession_ID", "Group"]].copy()
+        plot_df["PC1"], plot_df["PC2"] = coords[:, 0], coords[:, 1]
+
+        fig, ax = plt.subplots(figsize=(7, 6))
+        markers = {"Tumor": "^", "Normal": "o"}
+        for acc, g in plot_df.groupby("Accession_ID"):
+            for grp, gg in g.groupby("Group"):
+                ax.scatter(gg["PC1"], gg["PC2"], label=f"{acc} ({grp})",
+                           marker=markers.get(grp, "o"), s=60, alpha=0.8, edgecolor="k", linewidth=0.3)
+        ax.set_xlabel(f"PC1 ({pca.explained_variance_ratio_[0]*100:.1f}%)")
+        ax.set_ylabel(f"PC2 ({pca.explained_variance_ratio_[1]*100:.1f}%)")
+        ax.set_title(title)
+        ax.legend(bbox_to_anchor=(1.02, 1), loc="upper left", fontsize=8)
+        fig.tight_layout()
+        fig.savefig(os.path.join(OUTPUT_DIR, fname), dpi=200)
+        plt.close(fig)
+
+    # "before": log2-harmonized but not z-scored, so PCA isn't dominated by raw scale
+    before_df = log2_harmonize(raw_snapshot, mirna_cols, "Accession_ID", label="[before-PCA] ")
+    pca_plot(before_df, mirna_cols, "PCA before cross-platform normalization", "PCA_before_normalization.png")
+    pca_plot(normalized_df, mirna_cols, "PCA after cross-platform (z-score) normalization", "PCA_after_normalization.png")
+
+    print(f"\nDone. Outputs written to:\n  {OUTPUT_DIR}")
+    print("  - Sarcoma_TCGA_normalized.csv")
+    print("  - Sarcoma_GSE36982_normalized.csv")
+    print("  - Normal_combined_normalized.csv")
+    print("  - All_samples_normalized_long.csv  (all three combined, with Group/Accession columns)")
+    print("  - normalization_parameters.csv     (baseline mean/SD used per platform, for reuse)")
+    print("  - PCA_before_normalization.png")
+    print("  - PCA_after_normalization.png")
+
+
+if __name__ == "__main__":
+    main()
