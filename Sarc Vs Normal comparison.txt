@@ -23,7 +23,7 @@ OUT_DIR     = os.path.join(DATA_DIR, "sarcoma_VS_Normal_2")
 
 MIRNA_COLS = [
     "hsa-mir-196a", "hsa-mir-214", "hsa-mir-767",
-    "hsa-mir-1245a", "hsa-mir-1305", "hsa-mir-337", "hsa-mir-493"
+    "hsa-mir-1245a", "hsa-mir-1305", "hsa-mir-337", "hsa-mir-493" ,"hsa-mir-3152"
 ]
 
 FDR_THRESHOLD  = 0.05
