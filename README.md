@@ -18,7 +18,7 @@
 >#### Trains three cohort-specific Isolation Forest models (epithelial, haematological, neurological) using 5-fold cross-validation. Computes AUC-ROC, AUC-PR, sensitivity, and specificity with a constrained threshold strategy (maximise specificity subject to sensitivity ≥ 0.80). Runs TreeSHAP fold-by-fold on sarcoma samples and identifies consensus miRNAs appearing in the top-30 feature lists of two or more lineage comparisons.
 > -----------------------------------------------------------------
 >### Validation Code
->#### Performs Fisher’s LDA and LOOCV validate the relevance of the miRNAs identified in the previous process. In the step the matched normal sample is split proportionally between two cohort of samples - TCGA SARC and GSE36982 and compares relevance of the identified microRNAs. 
+>#### Performs Fisher’s LDA and LOOCV to validate the relevance of the miRNAs identified in the previous process. In the step the matched normal sample is split proportionally between two cohort of samples - TCGA SARC and GSE36982 and compares relevance of the identified microRNAs. 
 > -----------------------------------------------------------------
 > -----------------------------------------------------------------
 >### Sarc_Vs_Normal_comparison
