@@ -8,7 +8,7 @@
 >#### All_Samples_Study_IDs.csv contains the sample IDs  along with StudyIDs
 > ----------------------------------------------------------------
 ### Code accompanying the manuscript:
->#### "Cross-Lineage MicroRNA Analysis Defines Conserved Mesenchymal Identity and Prognostic Dysregulation in Sarcoma"
+>#### "Cross-Lineage Anomaly Detection of MicroRNA Expression: A Framework for Deriving Exploratory Candidate Biomarkers in Sarcoma"
 >#### Dey M, Remiszewski P, Perdas E, Golik P, Piątkowski J & Czarnecka AM
 > -----------------------------------------------------------------
 ### What this study does
