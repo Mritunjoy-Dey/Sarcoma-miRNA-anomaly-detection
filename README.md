@@ -15,10 +15,14 @@
 > -----------------------------------------------------------------
 ### Scripts
 >### Isolation_forest
->#### Trains three cohort-specific Isolation Forest models (epithelial, haematological, neurological) using 5-fold cross-validation. Computes AUC-ROC, AUC-PR, sensitivity, and specificity with a constrained threshold strategy (maximise specificity subject to sensitivity ≥ 0.80). Runs TreeSHAP fold-by-fold on sarcoma samples and identifies consensus miRNAs appearing in the top-20 feature lists of two or more lineage comparisons.
+>#### Trains three cohort-specific Isolation Forest models (epithelial, haematological, neurological) using 5-fold cross-validation. Computes AUC-ROC, AUC-PR, sensitivity, and specificity with a constrained threshold strategy (maximise specificity subject to sensitivity ≥ 0.80). Runs TreeSHAP fold-by-fold on sarcoma samples and identifies consensus miRNAs appearing in the top-30 feature lists of two or more lineage comparisons.
+> -----------------------------------------------------------------
+>### Validation Code
+>#### Performs Fisher’s LDA and LOOCV validate the relevance of the miRNAs identified in the previous process. In the step the matched normal sample is split proportionally between two cohort of samples - TCGA SARC and GSE36982 and compares relevance of the identified microRNAs. 
+> -----------------------------------------------------------------
 > -----------------------------------------------------------------
 >### Sarc_Vs_Normal_comparison
->#### Performs differential expression analysis of the consensus miRNAs between TCGA sarcoma (n = 262) and normal mesenchymal muscle tissue (GEO: GSE163534; n = 4). Uses Mann-Whitney U test with Benjamini-Hochberg FDR correction and rank-biserial correlation as effect size. Outputs a volcano plot, expression heatmap, violin plots, and MA plot.
+>#### Performs differential expression analysis of the consensus miRNAs between TCGA sarcoma and matched normal mesenchymal muscle tissue. Uses Mann-Whitney U test with Benjamini-Hochberg FDR correction and rank-biserial correlation as effect size. Outputs a volcano plot, expression heatmap, violin plots, and MA plot.
 > -----------------------------------------------------------------
 >### KM survival analysis
 >#### Runs Kaplan-Meier overall survival analysis for each consensus miRNA in TCGA-SARC. Patients are dichotomised by median expression; survival curves are compared using the log-rank test. Produces individual and combined KM plots with 95% confidence bands and a summary CSV.
