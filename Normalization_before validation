@@ -37,7 +37,7 @@ BASELINE_SOURCE = {
 
 # Below this many normal samples in a batch, don't trust that batch's own
 # SD -- borrow SD (not mean) from the largest available normal batch.
-MIN_N_FOR_OWN_SD = 5
+MIN_N_FOR_OWN_SD = 2
 
 # Values above this (95th percentile within a batch) are assumed to be on
 # a linear scale and get log2(x+1) transformed. Batches already log-scaled
